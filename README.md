@@ -1,5 +1,12 @@
 ## Swin MAE: Masked Autoencoders for Small Datasets
 
+### AI01: 11-channel Z-stack pretraining
+
+For the AI01 pipeline, use **`train_ai01.py`**, not the historical RGB `train.py`.
+See [README_AI01.md](README_AI01.md) for data layouts, training, strict encoder
+export/transfer into `A1_Refractor.ipynb`, and compatibility tests. The original
+RGB implementation below is preserved separately.
+
 ### Introduction
 This is a PyTorch implementation of [Swin MAE](https://arxiv.org/abs/2212.13805).
 

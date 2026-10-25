@@ -1,0 +1,6 @@
+# Separate environment from the historical RGB implementation.
+# Install the appropriate CUDA/CPU torch build for your machine first.
+torch>=2.6,<3
+transformers==4.53.1
+numpy>=1.24,<3
+safetensors>=0.4.3
