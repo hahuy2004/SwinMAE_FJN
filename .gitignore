@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 output_ai01*/
+
+AI01_SSL_SwinMAE_Colab.ipynb

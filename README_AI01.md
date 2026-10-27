@@ -8,6 +8,27 @@ The historical RGB `train.py`, `swin_mae.py`, `swin_unet.py` and `visualize.py`
 remain unchanged. **Use `train_ai01.py` for AI01.** The old RGB checkpoints and
 visualizer are not interchangeable with this branch.
 
+## Google Colab (clone repository + CLI)
+
+Open [`AI01_SSL_SwinMAE_Colab.ipynb`](AI01_SSL_SwinMAE_Colab.ipynb), enable a GPU,
+clone `https://github.com/hahuy2004/SwinMAE_FJN.git` and use
+`os.chdir("/content/SwinMAE_FJN")`. The notebook uses the repository's Python
+files directly; **no embedded model/trainer code**. Install `requirements-ai01.txt`
+and extract `Prepared_Dataset.zip` inside the cloned repository so that
+`Prepared_Dataset/train.txt` and `Prepared_Dataset/validation.txt` exist.
+
+The training cell is a direct **`!python -u train_ai01.py ...`** command. Defaults
+are one epoch capped at 3 training batches, followed by validation on all 72
+held-out samples. For longer training, change the parameters and use a new
+`OUTPUT_DIR`. Checkpoints default to a directory inside the clone. Download or
+back up files before a runtime reset, or set `OUTPUT_DIR` directly on Drive for
+per-epoch persistent saves. Drive backup/download and transfer verification are
+optional cells, disabled by default.
+
+For AI01 integration, use `encoder-best.pt`/`encoder-last.pt`, not the full
+`checkpoint-last.pt`. Resume examples are provided as Markdown so Run all never
+starts a second training job. Drive authentication itself requires Colab.
+
 ## 1. What is trained?
 
 ```text
@@ -144,6 +165,32 @@ needed. `--device cpu` also works. Workers default to 0 for Windows safety; tune
 `--num_workers` for your storage/machine. An epoch draws `len(dataset)` samples;
 well-balanced sampling is with replacement.
 
+### Progress and log files
+
+Use `--log_freq 20` (default) or `--log_freq 10` to print train and validation
+progress every N **batches**, plus the first and last batch. A step here is a
+DataLoader batch, not an optimizer update: with `--accum_iter 4`, weights are
+updated after four batches. Logs include current loss, running mean loss,
+learning rate (train), elapsed time and estimated remaining time for that phase.
+
+All logs are written incrementally under `--output_dir`:
+
+- `train.log`: timestamped console messages, epoch summaries and CLI exceptions.
+- `steps.jsonl`: structured metrics at the configured logging intervals.
+- `log.jsonl`: one summary per completed epoch, retained for existing plotting code.
+
+`--log_freq` controls logging only. `--save_freq 1` saves full/last checkpoints
+after every epoch; the best encoder is saved when validation MSE improves. It
+does not save a checkpoint every N logging steps. Logging frequency may be
+changed on resume without changing the training schedule.
+
+Manifest paths are relative to the manifest file's own directory. For example,
+if a line is `2/well/001.npy` and the image is under `datasets/2/well/001.npy`,
+the manifest should be stored in `datasets/`, not copied to its parent directory
+without changing its entries. For Colab, keeping images on the local `/content`
+disk and saving output checkpoints/logs to mounted Drive avoids many slow image
+reads through Drive.
+
 For a **format/training smoke test only**, not a useful pretrained model:
 
 ```powershell
@@ -165,6 +212,8 @@ Outputs:
 | `run_config.json` | Architecture, preprocessing and training arguments |
 | `train_files.txt`, `validation_files.txt` | Actual data manifests (validation file is optional) |
 | `log.jsonl` | Training/validation MSE and learning rate |
+| `train.log` | Timestamped console progress, summaries and errors |
+| `steps.jsonl` | Train/validation batch metrics at `--log_freq` intervals |
 
 Encoder exports contain all state-dict tensors, backbone config, preprocessing
 metadata and Transformers version. They do **not** include the SSL decoder.

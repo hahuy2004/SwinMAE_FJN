@@ -2,13 +2,17 @@
 
 import argparse
 from contextlib import nullcontext
+from datetime import datetime, timezone
 import hashlib
 from itertools import islice
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import random
+import sys
+import time
 
 # This entry point is PyTorch-only; do not import an unrelated TensorFlow install.
 os.environ.setdefault("USE_TF", "0")
@@ -49,6 +53,8 @@ def parser():
     result.add_argument("--no_amp", action="store_true")
     result.add_argument("--seed", type=int, default=42)
     result.add_argument("--save_freq", type=int, default=1)
+    result.add_argument("--log_freq", type=int, default=20,
+                        help="Log train/validation every N batches, plus the first and last batch")
     result.add_argument("--max_steps", type=int, default=0, help="Limit batches PER EPOCH; 0=all (smoke tests)")
     result.add_argument("--resume", help="checkpoint-last.pt: full SSL state at an epoch boundary")
     result.add_argument("--init_encoder", help="Optional encoder export to continue SSL, not RGB weights")
@@ -76,10 +82,43 @@ def autocast_context(device, enabled):
     return torch.autocast(device_type="cuda", dtype=torch.float16) if enabled else nullcontext()
 
 
-def train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp):
+def configure_logger(output):
+    logger = logging.getLogger("ai01_ssl")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    formatter = logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    for handler in (logging.StreamHandler(sys.stdout),
+                    logging.FileHandler(Path(output) / "train.log", mode="a", encoding="utf-8")):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+
+def log_progress(record, step_log=None, logger=None):
+    message = (f"[{record['phase']}] epoch={record['epoch']} "
+               f"step={record['step']}/{record['total_steps']} "
+               f"loss={record['loss']:.6f} avg_loss={record['loss_avg']:.6f}")
+    if "lr" in record:
+        message += f" lr={record['lr']:.3e}"
+    message += f" elapsed={record['elapsed_seconds']:.1f}s eta={record['eta_seconds']:.1f}s"
+    if logger is None:
+        print(message, flush=True)
+    else:
+        logger.info(message)
+    if step_log is not None:
+        with Path(step_log).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"time_utc": datetime.now(timezone.utc).isoformat(), **record}) + "\n")
+
+
+def train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
+                logger=None, step_log=None):
     model.train()
     steps = min(len(loader), args.max_steps) if args.max_steps else len(loader)
     total, samples = 0.0, 0
+    started = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
     for index, images in enumerate(islice(loader, steps)):
         set_learning_rate(optimizer, args, epoch, index, steps)
@@ -99,17 +138,27 @@ def train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp):
             optimizer.zero_grad(set_to_none=True)
         total += loss.item() * images.shape[0]
         samples += images.shape[0]
-        if index % 20 == 0 or index + 1 == steps:
-            print(f"epoch={epoch + 1} batch={index + 1}/{steps} loss={loss.item():.6f}", flush=True)
+        if index == 0 or (index + 1) % args.log_freq == 0 or index + 1 == steps:
+            elapsed = time.perf_counter() - started
+            log_progress({
+                "phase": "train", "epoch": epoch + 1, "step": index + 1,
+                "total_steps": steps, "global_step": epoch * steps + index + 1,
+                "loss": loss.item(), "loss_avg": total / samples,
+                "lr": optimizer.param_groups[0]["lr"], "samples_seen": samples,
+                "elapsed_seconds": elapsed,
+                "eta_seconds": elapsed / (index + 1) * (steps - index - 1),
+            }, step_log, logger)
     return total / samples
 
 
 @torch.no_grad()
-def validate(model, loader, device, seed, use_amp):
+def validate(model, loader, device, seed, use_amp, epoch=0, log_freq=20,
+             logger=None, step_log=None):
     model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
     total, samples = 0.0, 0
-    for images in loader:
+    started = time.perf_counter()
+    for index, images in enumerate(loader):
         images = images.to(device)
         mask = model.make_mask(images.shape[0], device, generator)
         with autocast_context(device, use_amp):
@@ -118,6 +167,14 @@ def validate(model, loader, device, seed, use_amp):
             raise FloatingPointError("Non-finite SSL validation loss")
         total += loss.item() * images.shape[0]
         samples += images.shape[0]
+        if index == 0 or (index + 1) % log_freq == 0 or index + 1 == len(loader):
+            elapsed = time.perf_counter() - started
+            log_progress({
+                "phase": "validation", "epoch": epoch + 1, "step": index + 1,
+                "total_steps": len(loader), "loss": loss.item(), "loss_avg": total / samples,
+                "samples_seen": samples, "elapsed_seconds": elapsed,
+                "eta_seconds": elapsed / (index + 1) * (len(loader) - index - 1),
+            }, step_log, logger)
     return total / samples
 
 
@@ -132,7 +189,7 @@ def dataset_signature(dataset):
 
 
 def main(args):
-    for name in ("epochs", "batch_size", "accum_iter", "save_freq"):
+    for name in ("epochs", "batch_size", "accum_iter", "save_freq", "log_freq"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
     if args.num_workers < 0 or args.max_steps < 0 or args.warmup_epochs < 0:
@@ -146,7 +203,14 @@ def main(args):
         raise ValueError("This entry point supports CPU or CUDA")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA is unavailable; pass --device cpu")
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    logger = configure_logger(output)
+    step_log = output / "steps.jsonl"
     use_amp = device.type == "cuda" and not args.no_amp
+    logger.info("Device=%s AMP=%s batch_size=%s accumulation=%s log_freq=%s batches",
+                device, use_amp, args.batch_size, args.accum_iter, args.log_freq)
+    logger.info("Output directory: %s", output.resolve())
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -160,7 +224,10 @@ def main(args):
     )
     # Fail early on format errors, before allocating the model/GPU.
     sample = dataset[0]
-    print(f"Images={len(dataset)}, first tensor={tuple(sample.shape)}, sampling={args.sampling}")
+    logger.info("Images=%s, first tensor=%s, sampling=%s", len(dataset), tuple(sample.shape), args.sampling)
+    if args.manifest:
+        logger.info("Train manifest: %s (relative image paths resolve from this file's parent)",
+                    Path(args.manifest).resolve())
     sampler = dataset.well_balanced_sampler(generator) if args.sampling == "well" else None
     loader = DataLoader(
         dataset, batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None,
@@ -176,12 +243,13 @@ def main(args):
         )
         ensure_disjoint_wells(dataset, validation_dataset)
         validation_loader = DataLoader(validation_dataset, batch_size=args.batch_size, shuffle=False)
+        logger.info("Validation images=%s, manifest=%s", len(validation_dataset), Path(args.val_manifest).resolve())
     model = AI01SwinMAE(
         mask_ratio=args.mask_ratio, mask_group_size=args.mask_group_size,
         norm_pix_loss=args.norm_pix_loss, decoder_depth=args.decoder_depth,
     )
     if args.init_encoder:
-        print(load_ai01_encoder(model.backbone, args.init_encoder))
+        logger.info("Initialized encoder: %s", load_ai01_encoder(model.backbone, args.init_encoder))
     model.to(device)
     decay, no_decay = [], []
     for parameter in model.parameters():
@@ -216,9 +284,7 @@ def main(args):
         generator.set_state(state["loader_rng"])
         if device.type == "cuda" and state["cuda_rng"]:
             torch.cuda.set_rng_state_all(state["cuda_rng"])
-        print(f"Resuming after epoch {start_epoch}")
-    output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+        logger.info("Resuming after epoch %s", start_epoch)
     (output / "run_config.json").write_text(json.dumps({
         "args": vars(args), "preprocessing": preprocessing,
         "backbone_config": model.config.to_dict(), "ssl_config": model.training_config(),
@@ -229,17 +295,23 @@ def main(args):
             "\n".join(map(str, validation_dataset.files)) + "\n", encoding="utf-8"
         )
     for epoch in range(start_epoch, args.epochs):
-        train_loss = train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp)
-        validation_loss = validate(model, validation_loader, device, args.seed, use_amp) if validation_loader else None
+        logger.info("Starting epoch %s/%s", epoch + 1, args.epochs)
+        train_loss = train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
+                                 logger=logger, step_log=step_log)
+        validation_loss = validate(model, validation_loader, device, args.seed, use_amp,
+                                   epoch=epoch, log_freq=args.log_freq, logger=logger,
+                                   step_log=step_log) if validation_loader else None
         if validation_loss is not None and validation_loss < best_loss:
             best_loss = validation_loss
             export_encoder(model.backbone, output / "encoder-best.pt", preprocessing)
+            logger.info("Saved encoder-best.pt: validation_loss=%.6f", best_loss)
         stats = {"epoch": epoch + 1, "train_loss": train_loss, "validation_loss": validation_loss,
                  "lr": optimizer.param_groups[0]["lr"]}
-        print(json.dumps(stats), flush=True)
+        logger.info("Epoch summary: %s", json.dumps(stats))
         with (output / "log.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(stats) + "\n")
         if (epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs:
+            logger.info("Saving full checkpoint and last encoder for epoch %s...", epoch + 1)
             atomic_save({
                 "format": "ai01-swin-mae-training-v1", "model": model.state_dict(),
                 "model_config": model.training_config(), "preprocessing": preprocessing,
@@ -251,8 +323,13 @@ def main(args):
                 "loader_rng": generator.get_state(),
             }, output / "checkpoint-last.pt")
             export_encoder(model.backbone, output / "encoder-last.pt", preprocessing)
-    print(f"Encoder export: {output / 'encoder-last.pt'}")
+            logger.info("Saved checkpoint-last.pt and encoder-last.pt")
+    logger.info("Encoder export: %s", output / "encoder-last.pt")
 
 
 if __name__ == "__main__":
-    main(parser().parse_args())
+    try:
+        main(parser().parse_args())
+    except Exception:
+        logging.getLogger("ai01_ssl").exception("Training failed")
+        raise
