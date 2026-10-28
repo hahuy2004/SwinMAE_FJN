@@ -34,13 +34,13 @@ starts a second training job. Drive authentication itself requires Colab.
 ```text
 unlabelled frame: [11, 400, 400, 1] (or already cropped)
   -> center crop / squeeze / normalize
-  -> [B, 11, 256, 256]
+  -> [B, 11, S, S], S = --image_size (224 or 256; default 256)
   -> 4x4 patch projection: 11 -> 96
   -> mask groups of 4x4 TOKENS (16x16 pixels), default 75%
   -> HF Swin V1 Tiny: depths [2,2,6,2], heads [3,6,12,24], window 7
   -> normalized feature maps at strides 4,8,16,32
   -> hierarchical reconstruction decoder
-  -> [B, 4096, 176] predicted patch pixels
+  -> [B, (S/4)^2, 176] predicted patch pixels
   -> masked-patch MSE against the original normalized stack
 ```
 
@@ -94,7 +94,10 @@ Supported `.npy` layouts (`--array_layout auto` by default):
 
 Use **raw intensities in [0,255]**, normally uint8, not already normalized arrays
 or floats rescaled to [0,1]. Finite values and shapes are checked. Images must be
-at least 256x256. A 400x400 input is cropped `[72:328,72:328]`, matching AI01.
+at least `--image_size` on each spatial axis. With the default 256, a 400x400
+input is cropped `[72:328,72:328]`, matching AI01. With 224 it is cropped
+`[88:312,88:312]`. This is a **center crop, not a resize**: the 224 setting sees
+a smaller field of view at the same pixel scale.
 All channels are retained in their stored order, Z0 through Z10.
 
 Normalization matches the notebook's one-channel image processor:
@@ -164,6 +167,58 @@ effective batch. CUDA fp16 AMP is on by default; disable with `--no_amp` if
 needed. `--device cpu` also works. Workers default to 0 for Windows safety; tune
 `--num_workers` for your storage/machine. An epoch draws `len(dataset)` samples;
 well-balanced sampling is with replacement.
+
+### Select the SSL image size
+
+Use `--image_size 224` or `--image_size 256` (default). This single argument sets
+train/validation center crops, encoder resolution, mask grid, reconstruction
+shape and checkpoint metadata. The 11 channels and **4x4 patch size remain
+unchanged** to match the downstream AI01 Swin-T. No patch-size argument is needed.
+
+| Image size | Patch grid | 4x4-token mask groups | Masked patches at 75% |
+| --- | --- | --- | --- |
+| 224 | 56x56 | 14x14 | 2352 of 3136 |
+| 256 | 64x64 | 16x16 | 3072 of 4096 |
+
+For example, in Colab (use a new, empty `OUTPUT_DIR`):
+
+```python
+!python -u train_ai01.py \
+    --manifest "/content/SwinMAE_FJN/datasets/train.txt" \
+    --val_manifest "/content/SwinMAE_FJN/datasets/val.txt" \
+    --output_dir "{OUTPUT_DIR}" \
+    --image_size 224 \
+    --epochs 20 \
+    --warmup_epochs 2 \
+    --max_steps 0 \
+    --batch_size 16 \
+    --accum_iter 2 \
+    --sampling frame \
+    --num_workers 2 \
+    --lr 0.0001 \
+    --min_lr 0.000001 \
+    --weight_decay 0.05 \
+    --mask_ratio 0.75 \
+    --clip_grad 1.0 \
+    --seed 42 \
+    --log_freq 20 \
+    --save_freq 1 \
+    --device cuda
+```
+
+Batch 16 / accumulation 2 keeps the nominal effective batch at 32, like 8 / 4.
+It is a configuration to **try**, not a VRAM guarantee. Benchmark a short run
+in a separate output directory before committing to a full run on your GPU.
+If it runs out of memory, use 8 / 4. A larger microbatch can improve throughput
+but does not guarantee better downstream accuracy; 32 / 1 should only be tried
+after checking memory and throughput. Do not automatically increase the LR when
+the effective batch stays unchanged.
+
+Full checkpoints now store `image_size` in `model_config`, so the usual preview
+constructor `AI01SwinMAE(**checkpoint["model_config"])` restores the right size.
+Older full checkpoints without that field still default to 256. Resume must keep
+the same image size, batch size and accumulation; changing them requires a new
+run, optionally initialized with `--init_encoder`.
 
 ### Progress and log files
 
@@ -251,7 +306,12 @@ The model-initialization cell now:
 4. Keeps the existing custom Mask2Former forward and BiMamba decoder replacement.
 
 The loader checks architecture, preprocessing, every tensor key and every shape
-before copying weights. **No `strict=False`, discarded layers or silent partial
+before copying weights. SSL crop size is allowed to differ: an encoder pretrained
+at 224 can be loaded into AI01 at 256 without changing weights because this Swin
+uses relative window positions, not absolute image-position embeddings. All
+other preprocessing fields (including Z order and normalization) must still
+match. This does not change AI01's input crop to 224 or retain the SSL decoder.
+**No `strict=False`, discarded layers or silent partial
 load.** Do not recreate the patch projection AFTER loading SSL. Do not later
 load an old full-model checkpoint or resume an unrelated supervised run unless
 you intend to overwrite the SSL initialization.

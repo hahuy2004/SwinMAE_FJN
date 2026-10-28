@@ -17,11 +17,11 @@ from transformers.models.swin.modeling_swin import SwinStage
 STAGE_NAMES = ["stage1", "stage2", "stage3", "stage4"]
 
 
-def ai01_swin_config():
+def ai01_swin_config(image_size=256):
     # Mirrors facebook/mask2former-swin-tiny-coco-instance, with 11-channel input.
     # No Hub download or pretrained RGB weights are required to start SSL.
     return SwinConfig(
-        image_size=256, patch_size=4, num_channels=11, embed_dim=96,
+        image_size=image_size, patch_size=4, num_channels=11, embed_dim=96,
         depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=7,
         mlp_ratio=4.0, qkv_bias=True, hidden_act="gelu", layer_norm_eps=1e-5,
         hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0,
@@ -77,13 +77,19 @@ class ReconstructionDecoder(nn.Module):
 
 class AI01SwinMAE(nn.Module):
     def __init__(self, mask_ratio=0.75, mask_group_size=4, norm_pix_loss=False,
-                 decoder_depth=2, encoder_config=None):
+                 decoder_depth=2, encoder_config=None, image_size=None):
         super().__init__()
         if not 0 < mask_ratio < 1:
             raise ValueError("mask_ratio must be strictly between 0 and 1")
         if mask_group_size < 1 or decoder_depth < 1:
             raise ValueError("mask_group_size and decoder_depth must be positive")
-        self.config = encoder_config if encoder_config is not None else ai01_swin_config()
+        self.config = encoder_config if encoder_config is not None else ai01_swin_config(
+            image_size=256 if image_size is None else image_size,
+        )
+        if image_size is not None and image_size != self.config.image_size:
+            raise ValueError("image_size and encoder_config.image_size must agree")
+        if not isinstance(self.config.image_size, int) or self.config.image_size < 32:
+            raise ValueError("Image size must be a positive integer multiple of 32")
         grid = self.config.image_size // self.config.patch_size
         if self.config.image_size % (self.config.patch_size * 8):
             raise ValueError("Image size must be divisible by the four-stage encoder stride (32)")
@@ -102,6 +108,7 @@ class AI01SwinMAE(nn.Module):
 
     def training_config(self):
         return {
+            "image_size": self.config.image_size,
             "mask_ratio": self.mask_ratio,
             "mask_group_size": self.mask_group_size,
             "norm_pix_loss": self.norm_pix_loss,

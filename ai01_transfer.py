@@ -48,6 +48,12 @@ def _read_export(path):
 
 def validate_preprocessing(saved, image_processor=None):
     expected = dict(DEFAULT_PREPROCESSING)
+    # Crop resolution may differ between SSL and fine-tuning. All other
+    # preprocessing (especially Z order and normalization) must still match.
+    image_size = saved.get("image_size")
+    if not isinstance(image_size, int) or image_size < 32 or image_size % 32:
+        raise ValueError("Preprocessing image_size must be a positive integer multiple of 32")
+    del expected["image_size"]
     if image_processor is not None:
         if image_processor.do_resize:
             raise ValueError("AI01 processor must have do_resize=False (dataset performs center crop)")
@@ -79,6 +85,8 @@ def load_ai01_encoder(model, path, image_processor=None):
         raise TypeError("AI01 target must use transformers.SwinBackbone (not SwinV2/MambaVision)")
     artifact = _read_export(path)
     source_config = SwinConfig.from_dict(artifact["backbone_config"])
+    if source_config.use_absolute_embeddings and source_config.image_size != target.config.image_size:
+        raise ValueError("Different image sizes require use_absolute_embeddings=False")
     for field in ARCHITECTURE_FIELDS:
         source, destination = getattr(source_config, field), getattr(target.config, field)
         if source != destination:

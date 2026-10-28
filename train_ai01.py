@@ -33,6 +33,8 @@ def parser():
     source.add_argument("--manifest", help="Text file listing unlabelled training .npy images")
     result.add_argument("--val_manifest", help="Optional fixed SSL validation set from separate wells")
     result.add_argument("--array_layout", choices=["auto", "zhwc", "zhw", "hwz"], default="auto")
+    result.add_argument("--image_size", type=int, choices=[224, 256], default=256,
+                        help="Square center-crop and SSL reconstruction size; patch size stays 4")
     result.add_argument("--sampling", choices=["well", "frame"], default="well")
     result.add_argument("--no_augment", action="store_true")
     result.add_argument("--output_dir", default="output_ai01_ssl")
@@ -189,6 +191,8 @@ def dataset_signature(dataset):
 
 
 def main(args):
+    if args.image_size not in (224, 256):
+        raise ValueError("image_size must be 224 or 256")
     for name in ("epochs", "batch_size", "accum_iter", "save_freq", "log_freq"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
@@ -218,6 +222,7 @@ def main(args):
         torch.cuda.manual_seed_all(args.seed)
     generator = torch.Generator().manual_seed(args.seed)
     preprocessing = dict(DEFAULT_PREPROCESSING)
+    preprocessing["image_size"] = args.image_size
     dataset = AI01UnlabelledDataset(
         data_path=args.data_path, manifest=args.manifest, preprocessing=preprocessing,
         array_layout=args.array_layout, augment=not args.no_augment,
@@ -247,6 +252,7 @@ def main(args):
     model = AI01SwinMAE(
         mask_ratio=args.mask_ratio, mask_group_size=args.mask_group_size,
         norm_pix_loss=args.norm_pix_loss, decoder_depth=args.decoder_depth,
+        image_size=args.image_size,
     )
     if args.init_encoder:
         logger.info("Initialized encoder: %s", load_ai01_encoder(model.backbone, args.init_encoder))
@@ -266,7 +272,9 @@ def main(args):
         state = torch.load(args.resume, map_location="cpu", weights_only=True)
         if state.get("format") != "ai01-swin-mae-training-v1":
             raise ValueError("Resume requires an AI01 SSL training checkpoint")
-        if state["model_config"] != model.training_config() or state["preprocessing"] != preprocessing:
+        # Checkpoints created before --image_size always used 256.
+        saved_model_config = {"image_size": 256, **state["model_config"]}
+        if saved_model_config != model.training_config() or state["preprocessing"] != preprocessing:
             raise ValueError("Resume model or preprocessing settings do not match")
         if state["dataset_signature"] != signature or state["validation_signature"] != validation_signature:
             raise ValueError("Resume dataset manifests do not match")
