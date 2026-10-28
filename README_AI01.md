@@ -168,12 +168,31 @@ needed. `--device cpu` also works. Workers default to 0 for Windows safety; tune
 `--num_workers` for your storage/machine. An epoch draws `len(dataset)` samples;
 well-balanced sampling is with replacement.
 
+With fp16 AMP, gradient clipping runs after `GradScaler.unscale_` and lets the
+scaler skip updates with Inf/NaN gradients and reduce its scale. Such an overflow
+does not itself stop training. Non-finite loss still raises immediately; with
+AMP disabled, non-finite gradient norms also remain fatal. A finite loss does
+not prove finite gradients, and repeated skipped updates still need diagnosis.
+
 ### Select the SSL image size
 
 Use `--image_size 224` or `--image_size 256` (default). This single argument sets
 train/validation center crops, encoder resolution, mask grid, reconstruction
 shape and checkpoint metadata. The 11 channels and **4x4 patch size remain
 unchanged** to match the downstream AI01 Swin-T. No patch-size argument is needed.
+
+The multi-scale decoder is an adaptation, not a proven improvement over a
+last-stage-only decoder. Shallow skips may make local reconstruction easier;
+they do not copy raw masked pixels (all features come from masked embeddings).
+To study mask difficulty without changing the decoder, compare the default
+`--mask_group_size 4` (16x16 pixels) with `--mask_group_size 8` (32x32 pixels)
+in separate runs, keeping other settings fixed. At size 256, group 8 masks
+exactly 75%; at 224 there are 49 groups, so rounding masks 37/49 (about 75.51%).
+Adjacent masked groups can form larger regions; a visible token inside every
+attention window is not guaranteed. Compare encoders through controlled
+downstream fine-tuning, not reconstruction MSE alone. Disabling skips would
+require a separate decoder variant and checkpoint configuration; this change
+does not silently remove them from existing models.
 
 | Image size | Patch grid | 4x4-token mask groups | Masked patches at 75% |
 | --- | --- | --- | --- |
@@ -202,6 +221,10 @@ For example, in Colab (use a new, empty `OUTPUT_DIR`):
     --clip_grad 1.0 \
     --seed 42 \
     --log_freq 20 \
+    --feature_samples 3 \
+    --feature_image_freq 5 \
+    --feature_mode both \
+    --stage_log_freq 20 \
     --save_freq 1 \
     --device cuda
 ```
@@ -233,6 +256,139 @@ All logs are written incrementally under `--output_dir`:
 - `train.log`: timestamped console messages, epoch summaries and CLI exceptions.
 - `steps.jsonl`: structured metrics at the configured logging intervals.
 - `log.jsonl`: one summary per completed epoch, retained for existing plotting code.
+
+### Stage feature diagnostics
+
+With `--val_manifest`, diagnostics run after the epoch summary and before the
+full/last checkpoint save. Defaults are:
+
+- `--feature_samples 3`: up to three fixed validation images, preferring one
+  frame from each distinct parent/well directory; fill from remaining frames if
+  there are fewer wells. `0` disables all feature logging.
+- `--feature_image_freq 5`: PNGs at baseline epoch 0, epoch 1, every fifth epoch, and the final
+  epoch. `0` disables PNGs but retains per-epoch statistics.
+- `--feature_mode both` (default): logs/saves the masked SSL encoder path and
+  the ordinary unmasked backbone forward separately. Either mode can also be
+  selected on its own.
+
+Each sample logs all four normalized stage outputs: shape, `finite`, `min`,
+`max`, `mean`, `std` and `spatial_std`. `std` is population standard deviation
+over the whole feature tensor. `spatial_std` is population standard deviation
+over HxW within each channel, averaged over channels. NaN/Inf produces a warning,
+a count of non-finite values and JSON `null` statistics, not invalid JSON NaNs.
+
+Additional geometry diagnostics use the full **spatial tokens x channels**
+matrix for each sample/stage, centered over tokens for PCA:
+
+- `effective_rank`: exp(entropy of normalized squared singular values), i.e.
+  variance-spectrum effective rank. `effective_rank_fraction` divides by
+  `max_centered_rank = min(H*W-1, C)`. At stage 4 this maximum is 63 for input
+  256 and 48 for input 224, not 768.
+- `pca_top1_variance_ratio`, `pca_top3_variance_ratio`: explained-variance
+  fractions. Undefined (JSON null) when there is no spatial variance.
+- `mean_token_cosine`: mean pairwise cosine of distinct **uncentered**, nonzero
+  token vectors, computed without materializing an NxN similarity matrix.
+- `low_variance_channel_fraction`: fraction of channels with population spatial
+  std below 1e-3. This is a debug threshold, not proof a neuron is dead. Min,
+  p10, median and max spatial std, plus the zero-token fraction, are also saved.
+- `feature_rel_l2_from_baseline`, `feature_cosine_from_baseline`: change in the
+  same fixed sample/mask/stage relative to the saved pre-training reference.
+
+Before a new run trains, the logger records **epoch 0**, labeled `random_init`
+or `init_encoder` as appropriate. Baseline features, PCA bases and RGB limits
+are persisted in `feature_debug/baseline_<signature>.pt`. Resume reuses these
+references (including when the output directory changes but the checkpoint's
+feature_debug directory is available), without rewriting epoch-0 images/logs.
+An old checkpoint or changed diagnostic sample/mode settings without a matching
+reference creates a clearly labeled **resume-epoch baseline**, not fake random
+epoch 0. Keep the baseline file with checkpoints to retain comparisons.
+
+Diagnostics run in `eval()` / `inference_mode()` using FP32 and no augmentation.
+Images and masks are cached on CPU. Each mask is generated with a dedicated CPU
+generator seeded with `--seed + validation_index`, so neither sample selection
+nor masks consume the training RNG. They remain fixed between epochs/resumes
+with the same data, model settings and seed. The diagnostic pass does not update
+weights and restores the previous model training/eval mode.
+Ordinary unmasked HF forwards can mutate per-layer window/shift attributes on
+small maps; diagnostics also restore those attributes before the next SSL pass.
+
+Example format (numbers below are placeholders, not experimental results):
+
+```text
+Epoch summary: {"epoch": 5, ...}
+[features] epoch=5 sample=0 mode=masked mask_seed=42 source=.../frame.npy
+[features] stage1 shape=(1, 96, 64, 64) finite=True min=... max=... mean=... std=... spatial_std=...
+[features] stage2 shape=(1, 192, 32, 32) finite=True min=... max=... mean=... std=... spatial_std=...
+[features] stage3 shape=(1, 384, 16, 16) finite=True min=... max=... mean=... std=... spatial_std=...
+[features] stage4 shape=(1, 768, 8, 8) finite=True min=... max=... mean=... std=... spatial_std=...
+[features] Saved feature_debug/epoch005_val0000_masked.png
+Saving full checkpoint and last encoder for epoch 5...
+```
+
+The stage shapes above are for 256 input; at 224 they are 56x56, 28x28, 14x14,
+7x7. The original channel PNG has four stage rows and four channel columns. The
+fixed channel indices are 0, C//3, 2*C//3, C-1. Each panel has its own 1st/99th
+percentile contrast limits: colors are not directly comparable amplitudes and
+are not segmentation probabilities. Only the fixed reference features are saved
+as tensors; no full feature tensors are dumped every epoch. A second
+`*_pca.png` shows all four stages as PCA-to-RGB maps. Each sample/mode/stage uses
+its own baseline-fitted mean, 3-component basis, and 1st/99th percentile RGB
+limits, frozen across epochs. Colors are comparable **over time for that same
+panel**, not across different samples or stages, and may saturate as features
+drift. PCA structure is not a semantic segmentation prediction.
+Plotting uses Matplotlib's headless Agg canvas, installed through the
+updated `requirements-ai01.txt`; include the new `ai01_features.py` when copying
+files to Colab.
+
+Outputs under `--output_dir`:
+
+- `train.log`: the same feature messages printed to the console.
+- `feature_stats.jsonl`: one structured row per epoch/sample/mode, including
+  source image, mask seed/hash, actual masked fraction and all stage statistics.
+- `feature_debug/samples.json`: the fixed sample indices, paths and mask metadata.
+- `feature_debug/epoch005_val0000_masked.png`: example naming for a feature PNG.
+- `feature_debug/epoch005_val0000_masked_pca.png`: matching PCA-to-RGB view.
+
+Without validation data, feature logging is explicitly disabled; it does not
+silently use augmented training images. Diagnostic options may change on resume
+without changing the optimization schedule, but keep them fixed for comparisons.
+Mean near zero/std near one can come from LayerNorm, and nonzero spatial
+variation is possible even before training. These are debugging signals, not
+proof of useful learning. Low spatial rank on one homogeneous image is not
+enough to diagnose dataset-wide collapse; compare multiple fixed images/modes.
+
+### Stage learning: gradients and actual parameter changes
+
+`--stage_log_freq 20` (default) logs each stage's gradient L2 norm every 20
+**optimizer update attempts**, plus first/last. This is independent of
+`--log_freq`, which counts DataLoader batches. `--stage_log_freq 0` disables this
+monitor; feature logging remains independently controlled.
+
+Gradients are read **after unscale and before clipping**. Logs distinguish
+missing gradients, zero gradients and non-finite gradient norms. AMP skip events
+and scale reductions are recorded even between sampled gradient logs. At the
+epoch summary, `weight_delta_norm`, `weight_rel_change` (delta norm divided by
+epoch-start parameter norm), `changed`, and successful/skipped update counts
+show whether parameters really changed. Snapshots are on CPU, once per epoch;
+they add roughly one encoder's worth of CPU RAM, not GPU RAM.
+
+Grouping follows HF encoder.layers: each stage includes its layer/downsampling
+parameters and corresponding output normalization; stage 1 also includes patch
+embeddings. Norms are not normalized for differing parameter counts; do not rank
+stage importance by their magnitude. Weight changes may include AdamW decay or
+momentum, so use gradient, skip, feature drift and reconstruction loss together.
+
+```text
+[learning] epoch=1 update=20/491 stage3 grad_norm=... finite=True grad_none=0 skipped=False
+[learning] epoch=1 stage3 weight_rel_change=... changed=True finite=True
+[learning] epoch=1 successful_updates=.../491 skipped=...
+```
+
+Messages go to console/`train.log`; structured gradient samples, skip events and
+epoch parameter deltas go to `stage_learning.jsonl`. This monitor also works
+without validation data. Copy the new `ai01_learning.py` along with the trainer.
+Neither gradients, parameter changes, non-collapse metrics nor PCA views prove
+PN usefulness; downstream fine-tuning/probing is still the deciding evaluation.
 
 `--log_freq` controls logging only. `--save_freq 1` saves full/last checkpoints
 after every epoch; the best encoder is saved when validation MSE improves. It
@@ -269,6 +425,9 @@ Outputs:
 | `log.jsonl` | Training/validation MSE and learning rate |
 | `train.log` | Timestamped console progress, summaries and errors |
 | `steps.jsonl` | Train/validation batch metrics at `--log_freq` intervals |
+| `feature_stats.jsonl` | Per-epoch fixed-sample stage activation statistics |
+| `stage_learning.jsonl` | Unscaled/pre-clip gradient norms, AMP skips and per-epoch weight deltas |
+| `feature_debug/` | Sample metadata and periodic four-stage PNG grids |
 
 Encoder exports contain all state-dict tensors, backbone config, preprocessing
 metadata and Transformers version. They do **not** include the SSL decoder.

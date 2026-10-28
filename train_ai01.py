@@ -22,6 +22,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from ai01_data import AI01UnlabelledDataset, DEFAULT_PREPROCESSING, ensure_disjoint_wells
+from ai01_features import FeatureLogger
+from ai01_learning import StageLearningMonitor
 from ai01_swin_mae import AI01SwinMAE
 from ai01_transfer import export_encoder, load_ai01_encoder
 
@@ -57,6 +59,13 @@ def parser():
     result.add_argument("--save_freq", type=int, default=1)
     result.add_argument("--log_freq", type=int, default=20,
                         help="Log train/validation every N batches, plus the first and last batch")
+    result.add_argument("--feature_samples", type=int, default=3,
+                        help="Fixed validation samples for stage diagnostics after each epoch; 0=off")
+    result.add_argument("--feature_image_freq", type=int, default=5,
+                        help="Save feature PNGs at epoch 1, every N epochs and last; 0=statistics only")
+    result.add_argument("--feature_mode", choices=["masked", "unmasked", "both"], default="both")
+    result.add_argument("--stage_log_freq", type=int, default=20,
+                        help="Stage gradient diagnostics every N optimizer updates, plus first/last; 0=off")
     result.add_argument("--max_steps", type=int, default=0, help="Limit batches PER EPOCH; 0=all (smoke tests)")
     result.add_argument("--resume", help="checkpoint-last.pt: full SSL state at an epoch boundary")
     result.add_argument("--init_encoder", help="Optional encoder export to continue SSL, not RGB weights")
@@ -116,12 +125,15 @@ def log_progress(record, step_log=None, logger=None):
 
 
 def train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
-                logger=None, step_log=None):
+                logger=None, step_log=None, learning_monitor=None):
     model.train()
     steps = min(len(loader), args.max_steps) if args.max_steps else len(loader)
     total, samples = 0.0, 0
     started = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
+    total_updates = math.ceil(steps / args.accum_iter)
+    if learning_monitor is not None:
+        learning_monitor.begin_epoch(epoch + 1)
     for index, images in enumerate(islice(loader, steps)):
         set_learning_rate(optimizer, args, epoch, index, steps)
         images = images.to(device, non_blocking=device.type == "cuda")
@@ -134,9 +146,20 @@ def train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
         scaler.scale(loss / group_size).backward()
         if (index + 1) % args.accum_iter == 0 or index + 1 == steps:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad, error_if_nonfinite=True)
+            update = index // args.accum_iter + 1
+            gradients = learning_monitor.gradients() if learning_monitor is not None and learning_monitor.wants_gradients(update, total_updates) else None
+            # unscale_ records Inf/NaN so an enabled GradScaler can skip this
+            # update and reduce its scale. Do not raise before step/update.
+            # Without scaling there is no such recovery: keep failing loudly.
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.clip_grad, error_if_nonfinite=not scaler.is_enabled(),
+            )
+            scale_before = scaler.get_scale() if learning_monitor is not None and scaler.is_enabled() else None
             scaler.step(optimizer)
             scaler.update()
+            if learning_monitor is not None:
+                learning_monitor.finish_update(update, total_updates, index + 1, gradients,
+                                               scale_before, scaler.get_scale() if scaler.is_enabled() else None)
             optimizer.zero_grad(set_to_none=True)
         total += loss.item() * images.shape[0]
         samples += images.shape[0]
@@ -198,6 +221,8 @@ def main(args):
             raise ValueError(f"{name} must be positive")
     if args.num_workers < 0 or args.max_steps < 0 or args.warmup_epochs < 0:
         raise ValueError("Worker, step and warmup counts cannot be negative")
+    if args.feature_samples < 0 or args.feature_image_freq < 0 or args.stage_log_freq < 0:
+        raise ValueError("feature_samples, feature_image_freq and stage_log_freq cannot be negative")
     if not 0 <= args.min_lr <= args.lr or args.lr <= 0 or args.clip_grad <= 0:
         raise ValueError("Require lr > 0, 0 <= min_lr <= lr and clip_grad > 0")
     if args.resume and args.init_encoder:
@@ -302,10 +327,25 @@ def main(args):
         (output / "validation_files.txt").write_text(
             "\n".join(map(str, validation_dataset.files)) + "\n", encoding="utf-8"
         )
+    feature_logger = None
+    if args.feature_samples:
+        if validation_dataset is None:
+            logger.info("[features] Disabled: provide --val_manifest for fixed validation samples")
+        else:
+            feature_logger = FeatureLogger(
+                model, validation_dataset, output, logger, samples=args.feature_samples,
+                image_freq=args.feature_image_freq, mode=args.feature_mode, seed=args.seed,
+            )
+            feature_logger.initialize_baseline(
+                model, device, epoch=start_epoch, total_epochs=args.epochs,
+                origin="resume" if args.resume else "init_encoder" if args.init_encoder else "random_init",
+                resume_directory=Path(args.resume).parent if args.resume else None,
+            )
+    learning_monitor = StageLearningMonitor(model.backbone, output, logger, args.stage_log_freq) if args.stage_log_freq else None
     for epoch in range(start_epoch, args.epochs):
         logger.info("Starting epoch %s/%s", epoch + 1, args.epochs)
         train_loss = train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
-                                 logger=logger, step_log=step_log)
+                                 logger=logger, step_log=step_log, learning_monitor=learning_monitor)
         validation_loss = validate(model, validation_loader, device, args.seed, use_amp,
                                    epoch=epoch, log_freq=args.log_freq, logger=logger,
                                    step_log=step_log) if validation_loader else None
@@ -318,6 +358,10 @@ def main(args):
         logger.info("Epoch summary: %s", json.dumps(stats))
         with (output / "log.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(stats) + "\n")
+        if learning_monitor is not None:
+            learning_monitor.end_epoch()
+        if feature_logger is not None:
+            feature_logger.log_epoch(model, device, epoch + 1, args.epochs)
         if (epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs:
             logger.info("Saving full checkpoint and last encoder for epoch %s...", epoch + 1)
             atomic_save({
