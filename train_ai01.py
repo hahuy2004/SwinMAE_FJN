@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 from ai01_data import AI01UnlabelledDataset, DEFAULT_PREPROCESSING, ensure_disjoint_wells
 from ai01_features import FeatureLogger
 from ai01_learning import StageLearningMonitor
+from ai01_metrics import ReconstructionMetricLogger, validate_ssim_window
 from ai01_swin_mae import AI01SwinMAE
 from ai01_transfer import export_encoder, load_ai01_encoder
 
@@ -66,6 +67,10 @@ def parser():
     result.add_argument("--feature_mode", choices=["masked", "unmasked", "both"], default="both")
     result.add_argument("--stage_log_freq", type=int, default=20,
                         help="Stage gradient diagnostics every N optimizer updates, plus first/last; 0=off")
+    result.add_argument("--no_reconstruction_metrics", action="store_true",
+                        help="Disable full-validation masked PSNR/SSIM/MAE/RMSE/gradient MAE")
+    result.add_argument("--ssim_window", type=int, default=7,
+                        help="Odd uniform SSIM window; only fully masked valid windows are scored")
     result.add_argument("--max_steps", type=int, default=0, help="Limit batches PER EPOCH; 0=all (smoke tests)")
     result.add_argument("--resume", help="checkpoint-last.pt: full SSL state at an epoch boundary")
     result.add_argument("--init_encoder", help="Optional encoder export to continue SSL, not RGB weights")
@@ -178,7 +183,7 @@ def train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
 
 @torch.no_grad()
 def validate(model, loader, device, seed, use_amp, epoch=0, log_freq=20,
-             logger=None, step_log=None):
+             logger=None, step_log=None, reconstruction_monitor=None):
     model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
     total, samples = 0.0, 0
@@ -187,9 +192,14 @@ def validate(model, loader, device, seed, use_amp, epoch=0, log_freq=20,
         images = images.to(device)
         mask = model.make_mask(images.shape[0], device, generator)
         with autocast_context(device, use_amp):
-            loss, _, _ = model(images, mask)
+            loss, prediction, _ = model(images, mask)
         if not torch.isfinite(loss):
             raise FloatingPointError("Non-finite SSL validation loss")
+        if reconstruction_monitor is not None:
+            if model.norm_pix_loss:
+                raise ValueError("Intensity reconstruction metrics do not support norm_pix_loss targets")
+            reconstruction_monitor.update(images, model.unpatchify(prediction), mask,
+                                          model.config.patch_size, samples, seed)
         total += loss.item() * images.shape[0]
         samples += images.shape[0]
         if index == 0 or (index + 1) % log_freq == 0 or index + 1 == len(loader):
@@ -214,6 +224,7 @@ def dataset_signature(dataset):
 
 
 def main(args):
+    validate_ssim_window(args.ssim_window)
     if args.image_size not in (224, 256):
         raise ValueError("image_size must be 224 or 256")
     for name in ("epochs", "batch_size", "accum_iter", "save_freq", "log_freq"):
@@ -240,6 +251,11 @@ def main(args):
     logger.info("Device=%s AMP=%s batch_size=%s accumulation=%s log_freq=%s batches",
                 device, use_amp, args.batch_size, args.accum_iter, args.log_freq)
     logger.info("Output directory: %s", output.resolve())
+    reconstruction_enabled = not args.no_reconstruction_metrics and not args.norm_pix_loss
+    if not args.no_reconstruction_metrics and args.norm_pix_loss:
+        logger.warning("[reconstruction] Disabled: norm_pix_loss predicts patch-standardized targets, not absolute intensities")
+    if args.ssim_window > args.image_size:
+        raise ValueError("ssim_window cannot exceed image_size")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -346,15 +362,25 @@ def main(args):
         logger.info("Starting epoch %s/%s", epoch + 1, args.epochs)
         train_loss = train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
                                  logger=logger, step_log=step_log, learning_monitor=learning_monitor)
+        reconstruction_monitor = ReconstructionMetricLogger(
+            validation_dataset.files, preprocessing, output, logger, args.ssim_window,
+            context={"scope": "full_validation", "batch_size": args.batch_size, "device": str(device),
+                     "amp": use_amp, "dataset_signature": validation_signature},
+        ) if validation_dataset is not None and reconstruction_enabled else None
         validation_loss = validate(model, validation_loader, device, args.seed, use_amp,
                                    epoch=epoch, log_freq=args.log_freq, logger=logger,
-                                   step_log=step_log) if validation_loader else None
+                                   step_log=step_log, reconstruction_monitor=reconstruction_monitor) if validation_loader else None
+        reconstruction_report = reconstruction_monitor.write(epoch + 1) if reconstruction_monitor is not None else None
         if validation_loss is not None and validation_loss < best_loss:
             best_loss = validation_loss
             export_encoder(model.backbone, output / "encoder-best.pt", preprocessing)
             logger.info("Saved encoder-best.pt: validation_loss=%.6f", best_loss)
         stats = {"epoch": epoch + 1, "train_loss": train_loss, "validation_loss": validation_loss,
                  "lr": optimizer.param_groups[0]["lr"]}
+        if reconstruction_report is not None:
+            stats["validation_reconstruction_well_macro"] = {
+                name: entry["mean"] for name, entry in reconstruction_report["well_macro"].items()
+            }
         logger.info("Epoch summary: %s", json.dumps(stats))
         with (output / "log.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(stats) + "\n")

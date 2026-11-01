@@ -257,6 +257,108 @@ All logs are written incrementally under `--output_dir`:
 - `steps.jsonl`: structured metrics at the configured logging intervals.
 - `log.jsonl`: one summary per completed epoch, retained for existing plotting code.
 
+### Reconstruction quality metrics (full validation)
+
+With `--val_manifest`, the trainer now evaluates **every validation frame** after
+each epoch, reusing the predictions and masks from ordinary validation. Training
+loss, optimizer, model/checkpoint format and best-encoder selection are unchanged.
+No extra network forward is needed. Copy `ai01_metrics.py` alongside the trainer
+when updating Colab; no new pip dependency is required.
+
+| Metric | Interpretation | Unit |
+| --- | --- | --- |
+| `masked_psnr` | Higher is better / Càng cao càng tốt | dB |
+| `masked_ssim` | Closer to 1 is better / Càng gần 1 càng tốt | Dimensionless; may be negative |
+| `masked_mae` | Lower is better / Càng thấp càng tốt | Gray levels, 0..255 reference scale |
+| `masked_rmse` | Lower is better / Càng thấp càng tốt | Gray levels, 0..255 reference scale |
+| `masked_gradient_mae` | Lower is better / Càng thấp càng tốt | Gray-level differences per pixel |
+
+These are full-reference reconstruction measurements, not segmentation accuracy
+or evidence that PN details are biologically correct. PSNR and RMSE are derived
+from MSE; SSIM and gradient MAE add structural/detail comparisons, but none has a
+universal "good model" threshold. Do not optimize image sharpness alone.
+
+Protocol:
+
+- Undo dataset normalization with `x_01 = x * std + mean`, using the saved
+  preprocessing, **without clipping or per-image min-max stretching**. Fix the
+  PSNR/SSIM data range at 1. Errors are converted to the 0..255 reference scale
+  only for MAE/RMSE/gradient MAE. They are not in training-loss units.
+- PSNR/MAE/RMSE score masked pixels only. PSNR is computed for each frame/Z/seed
+  before averaging dB; this is NOT PSNR of pooled MSE. Exact/near-exact prediction
+  PSNR is capped at 120 dB (MSE floor 1e-12) for finite, standards-compliant JSON.
+- SSIM uses uniform 7x7 **valid** windows, K1=.01, K2=.03 and population
+  covariance. Average the SSIM map only where the **entire window is masked**,
+  excluding image edges and copied/visible pixels. This is a masked-window
+  protocol, not ordinary full-image SSIM. `--ssim_window` changes the odd window
+  size; keep it fixed between experiments. Windows overlapping the mask boundary
+  are excluded, so this metric does not measure seam quality.
+- Gradient MAE compares horizontal/vertical one-pixel finite differences only
+  for pairs with both endpoints masked. A lower score means gradients better
+  match the reference, not merely that the prediction is sharper.
+- If a mask has no eligible SSIM windows/gradient pairs, that measurement is
+  `null` with a valid count of 0, not a fake zero score. Aggregates exclude
+  undefined measurements, report valid counts and warn about missing windows.
+- Evaluate each Z separately. Aggregate seeds for the same frame/Z first, then
+  Z per frame, then frames per parent/well. **`well_macro` is the primary result:**
+  equal-weight mean +/- population std across wells. `frame_macro` gives equal
+  frame weighting. Std is dispersion, not a confidence interval; adjacent frames
+  are not independent patients. Per-Z, per-well and directory-group summaries
+  are included. A well means one parent directory, not verified patient identity.
+- Validation keeps its existing fixed random generator. For reproducible masks
+  between epochs/models, keep seed, ordered manifest, batch size and device
+  fixed. Full-validation metric evaluation is independent of `--max_steps`,
+  which limits training only, and `--feature_samples`, which limits debug images.
+
+Files under `--output_dir`:
+
+- `reconstruction_metrics.log`: readable numbers with higher/lower-is-better
+  labels, units, frame/well aggregates, each Z, group and well.
+- `reconstruction_metrics.jsonl`: one complete structured report per epoch.
+- `reconstruction_metrics_latest.json`: the latest report, including protocol,
+  directions, sample counts, valid counts and mean/std.
+- `log.jsonl` additionally includes `validation_reconstruction_well_macro`.
+  Existing `train_loss`/`validation_loss` plotting still works. Console/`train.log`
+  prints the frame and well summaries with directions.
+
+Metrics are on by default; `--no_reconstruction_metrics` disables their overhead.
+They are explicitly disabled with a warning for `--norm_pix_loss`: those outputs
+are patch-standardized, not absolute image intensities. Do NOT invert them with
+ground-truth patch means/variances, which would leak unavailable target information.
+
+#### Evaluate an existing full checkpoint without retraining
+
+Use the new `evaluate_ai01.py`, **not** `--resume`, to evaluate an already completed
+100-epoch run. The output directory must be new/empty; training files are never
+overwritten. Architecture, crop size and preprocessing come from the checkpoint.
+Encoder-only `encoder-best.pt`/`encoder-last.pt` lack the decoder and are rejected.
+
+```python
+!python -u evaluate_ai01.py \
+    --checkpoint "/content/drive/MyDrive/0_Note_FJN/SwinMAE_FJN/output/v1/output_swin_v1_224_100e_bs16/checkpoint-last.pt" \
+    --val_manifest "/content/SwinMAE_FJN/datasets/val.txt" \
+    --output_dir "/content/drive/MyDrive/0_Note_FJN/SwinMAE_FJN/output/v1/metrics_epoch100" \
+    --batch_size 32 \
+    --mask_seeds 42 43 44 \
+    --num_workers 2 \
+    --device cuda
+```
+
+Default `--max_samples 0` evaluates the WHOLE validation manifest for every seed.
+Nonzero `--max_samples` is only for a clearly labeled first-N-frame smoke test,
+not the dataset result. By default the checkpoint's seed is used; the example
+above deliberately averages three mask realizations per frame. Do not interpret
+std across wells as std across seeds. Use the same protocol for every model.
+
+Local example logs in `examples/ai01_reconstruction_metrics_smoke/` are an actual
+evaluation of the old **1-epoch / 3-training-batch smoke checkpoint**, on only
+three validation frames at size 256. They demonstrate the file format and are
+**not** results for the user's 224 / 100-epoch model or the full validation set.
+Generated example logs/checkpoints are ignored by Git and are not included in a
+fresh clone. To create your own format example, run the evaluator with a full
+checkpoint, a new output directory and `--max_samples 3`; omit that option for
+the actual full-validation report.
+
 ### Stage feature diagnostics
 
 With `--val_manifest`, diagnostics run after the epoch summary and before the
@@ -423,6 +525,9 @@ Outputs:
 | `run_config.json` | Architecture, preprocessing and training arguments |
 | `train_files.txt`, `validation_files.txt` | Actual data manifests (validation file is optional) |
 | `log.jsonl` | Training/validation MSE and learning rate |
+| `reconstruction_metrics.log` | Readable masked reconstruction metrics, units and higher/lower-is-better labels |
+| `reconstruction_metrics.jsonl` | Full-validation frame/well/Z/group metric reports per epoch |
+| `reconstruction_metrics_latest.json` | Latest complete reconstruction metric report |
 | `train.log` | Timestamped console progress, summaries and errors |
 | `steps.jsonl` | Train/validation batch metrics at `--log_freq` intervals |
 | `feature_stats.jsonl` | Per-epoch fixed-sample stage activation statistics |

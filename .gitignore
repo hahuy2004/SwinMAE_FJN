@@ -1,5 +1,36 @@
+# Python caches
 __pycache__/
 *.py[cod]
-output_ai01*/
+.pytest_cache/
 
+# Training/evaluation output directories
+output_ai01*/
+/output/
+/output_*/
+metrics_eval/
+feature_debug/
+
+# Model checkpoints and temporary checkpoint files
+*.pt
+*.pth
+*.pt.tmp
+*.pth.tmp
+
+# Generated logs and validation reports
+*.log
+log.jsonl
+steps.jsonl
+feature_stats.jsonl
+stage_learning.jsonl
+reconstruction_metrics.jsonl
+reconstruction_metrics_latest.json
+reconstruction_metrics_latest.json.tmp
+run_config.json
+train_files.txt
+validation_files.txt
+
+# Local smoke-test demonstration artifacts (not implementation files)
+/examples/ai01_reconstruction_metrics_smoke/
+
+# Local Colab notebook
 AI01_SSL_SwinMAE_Colab.ipynb
