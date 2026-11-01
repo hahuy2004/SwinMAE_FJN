@@ -26,6 +26,7 @@ from ai01_features import FeatureLogger
 from ai01_learning import StageLearningMonitor
 from ai01_metrics import ReconstructionMetricLogger, validate_ssim_window
 from ai01_swin_mae import AI01SwinMAE
+from ai01_targets import DEFAULT_TARGET_Z, checkpoint_model_config, validate_target_z
 from ai01_transfer import export_encoder, load_ai01_encoder
 
 
@@ -54,6 +55,8 @@ def parser():
     result.add_argument("--mask_group_size", type=int, default=4)
     result.add_argument("--decoder_depth", type=int, default=2)
     result.add_argument("--norm_pix_loss", action="store_true")
+    result.add_argument("--target_z", nargs="+", type=int, default=list(DEFAULT_TARGET_Z),
+                        help="Zero-based Z targets for loss/metrics (default: 5 6 7); encoder still receives all 11 Z")
     result.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     result.add_argument("--no_amp", action="store_true")
     result.add_argument("--seed", type=int, default=42)
@@ -198,6 +201,8 @@ def validate(model, loader, device, seed, use_amp, epoch=0, log_freq=20,
         if reconstruction_monitor is not None:
             if model.norm_pix_loss:
                 raise ValueError("Intensity reconstruction metrics do not support norm_pix_loss targets")
+            if tuple(reconstruction_monitor.target_z) != tuple(getattr(model, "target_z", reconstruction_monitor.target_z)):
+                raise ValueError("Metric target_z must match the model's supervised Z")
             reconstruction_monitor.update(images, model.unpatchify(prediction), mask,
                                           model.config.patch_size, samples, seed)
         total += loss.item() * images.shape[0]
@@ -225,6 +230,7 @@ def dataset_signature(dataset):
 
 def main(args):
     validate_ssim_window(args.ssim_window)
+    args.target_z = list(validate_target_z(args.target_z, DEFAULT_PREPROCESSING["num_channels"]))
     if args.image_size not in (224, 256):
         raise ValueError("image_size must be 224 or 256")
     for name in ("epochs", "batch_size", "accum_iter", "save_freq", "log_freq"):
@@ -251,6 +257,7 @@ def main(args):
     logger.info("Device=%s AMP=%s batch_size=%s accumulation=%s log_freq=%s batches",
                 device, use_amp, args.batch_size, args.accum_iter, args.log_freq)
     logger.info("Output directory: %s", output.resolve())
+    logger.info("Reconstruction supervision: target_z=%s (zero-based); input retains all 11 Z", args.target_z)
     reconstruction_enabled = not args.no_reconstruction_metrics and not args.norm_pix_loss
     if not args.no_reconstruction_metrics and args.norm_pix_loss:
         logger.warning("[reconstruction] Disabled: norm_pix_loss predicts patch-standardized targets, not absolute intensities")
@@ -294,6 +301,7 @@ def main(args):
         mask_ratio=args.mask_ratio, mask_group_size=args.mask_group_size,
         norm_pix_loss=args.norm_pix_loss, decoder_depth=args.decoder_depth,
         image_size=args.image_size,
+        target_z=args.target_z,
     )
     if args.init_encoder:
         logger.info("Initialized encoder: %s", load_ai01_encoder(model.backbone, args.init_encoder))
@@ -313,8 +321,10 @@ def main(args):
         state = torch.load(args.resume, map_location="cpu", weights_only=True)
         if state.get("format") != "ai01-swin-mae-training-v1":
             raise ValueError("Resume requires an AI01 SSL training checkpoint")
-        # Checkpoints created before --image_size always used 256.
-        saved_model_config = {"image_size": 256, **state["model_config"]}
+        # Legacy checkpoints used 256 if size is absent, and ALL Z if target_z is absent.
+        saved_model_config = checkpoint_model_config(state["model_config"])
+        if saved_model_config["target_z"] != list(model.target_z):
+            raise ValueError("Resume target_z differs from the checkpoint. Start a NEW run with --init_encoder to change supervision; do not silently resume the old objective")
         if saved_model_config != model.training_config() or state["preprocessing"] != preprocessing:
             raise ValueError("Resume model or preprocessing settings do not match")
         if state["dataset_signature"] != signature or state["validation_signature"] != validation_signature:
@@ -366,6 +376,7 @@ def main(args):
             validation_dataset.files, preprocessing, output, logger, args.ssim_window,
             context={"scope": "full_validation", "batch_size": args.batch_size, "device": str(device),
                      "amp": use_amp, "dataset_signature": validation_signature},
+            target_z=model.target_z,
         ) if validation_dataset is not None and reconstruction_enabled else None
         validation_loss = validate(model, validation_loader, device, args.seed, use_amp,
                                    epoch=epoch, log_freq=args.log_freq, logger=logger,
@@ -376,7 +387,8 @@ def main(args):
             export_encoder(model.backbone, output / "encoder-best.pt", preprocessing)
             logger.info("Saved encoder-best.pt: validation_loss=%.6f", best_loss)
         stats = {"epoch": epoch + 1, "train_loss": train_loss, "validation_loss": validation_loss,
-                 "lr": optimizer.param_groups[0]["lr"]}
+                 "lr": optimizer.param_groups[0]["lr"], "target_z": list(model.target_z),
+                 "input_num_z": model.config.num_channels}
         if reconstruction_report is not None:
             stats["validation_reconstruction_well_macro"] = {
                 name: entry["mean"] for name, entry in reconstruction_report["well_macro"].items()

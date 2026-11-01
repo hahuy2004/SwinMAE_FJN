@@ -13,6 +13,8 @@ from torch import nn
 from transformers import SwinBackbone, SwinConfig
 from transformers.models.swin.modeling_swin import SwinStage
 
+from ai01_targets import DEFAULT_TARGET_Z, validate_target_z
+
 
 STAGE_NAMES = ["stage1", "stage2", "stage3", "stage4"]
 
@@ -77,7 +79,7 @@ class ReconstructionDecoder(nn.Module):
 
 class AI01SwinMAE(nn.Module):
     def __init__(self, mask_ratio=0.75, mask_group_size=4, norm_pix_loss=False,
-                 decoder_depth=2, encoder_config=None, image_size=None):
+                 decoder_depth=2, encoder_config=None, image_size=None, target_z=DEFAULT_TARGET_Z):
         super().__init__()
         if not 0 < mask_ratio < 1:
             raise ValueError("mask_ratio must be strictly between 0 and 1")
@@ -101,6 +103,7 @@ class AI01SwinMAE(nn.Module):
         self.mask_group_size = mask_group_size
         self.norm_pix_loss = norm_pix_loss
         self.decoder_depth = decoder_depth
+        self.target_z = validate_target_z(target_z, self.config.num_channels)
         self.backbone = SwinBackbone(self.config)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.config.embed_dim))
         nn.init.normal_(self.mask_token, std=0.02)
@@ -113,6 +116,7 @@ class AI01SwinMAE(nn.Module):
             "mask_group_size": self.mask_group_size,
             "norm_pix_loss": self.norm_pix_loss,
             "decoder_depth": self.decoder_depth,
+            "target_z": list(self.target_z),
         }
 
     def make_mask(self, batch_size, device, generator=None):
@@ -170,17 +174,22 @@ class AI01SwinMAE(nn.Module):
         return tuple(features)
 
     def forward_loss(self, images, prediction, mask):
-        # Compute MSE in fp32 even under autocast; raw normalized pixels by default.
+        # Encoder inputs and decoder layout remain 11 Z. Supervise selected Z only.
         target = self.patchify(images).float()
-        if self.norm_pix_loss:
-            mean = target.mean(dim=-1, keepdim=True)
-            variance = target.var(dim=-1, keepdim=True, unbiased=False)
-            target = (target - mean) / (variance + 1e-6).sqrt()
         if prediction.shape != target.shape or mask.shape != target.shape[:2]:
             raise ValueError("Prediction, target and mask shapes must agree")
         if not mask.any():
             raise ValueError("At least one patch must be masked")
-        error = (prediction.float() - target).square().mean(dim=-1)
+        # patchify orders values as [pixel_in_patch, Z], not contiguous Z blocks.
+        shape = (*target.shape[:2], self.config.patch_size ** 2, self.config.num_channels)
+        target = target.reshape(shape)[..., list(self.target_z)].flatten(-2)
+        prediction = prediction.float().reshape(shape)[..., list(self.target_z)].flatten(-2)
+        if self.norm_pix_loss:
+            # Do not let unsupervised Z affect target normalization indirectly.
+            mean = target.mean(dim=-1, keepdim=True)
+            variance = target.var(dim=-1, keepdim=True, unbiased=False)
+            target = (target - mean) / (variance + 1e-6).sqrt()
+        error = (prediction - target).square().mean(dim=-1)
         return (error * mask).sum() / mask.sum()
 
     def forward(self, images, mask=None):

@@ -13,6 +13,8 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+from ai01_targets import validate_target_z
+
 
 METRICS = {
     "masked_psnr": {"unit": "dB", "better": "higher", "interpretation_vi": "Càng cao càng tốt"},
@@ -30,8 +32,8 @@ def validate_ssim_window(window):
 
 
 @torch.no_grad()
-def reconstruction_metrics(images, predictions, patch_mask, patch_size, preprocessing, ssim_window=7):
-    """Return [B, Z, 5] metrics and [B] counts of eligible SSIM windows.
+def reconstruction_metrics(images, predictions, patch_mask, patch_size, preprocessing, ssim_window=7, target_z=None):
+    """Return [B, selected Z, 5] metrics and [B] eligible SSIM window counts.
 
     SSIM uses uniform, valid windows and population covariance (K1=.01, K2=.03).
     Only windows ENTIRELY masked are eligible. Gradient MAE compares horizontal
@@ -49,10 +51,11 @@ def reconstruction_metrics(images, predictions, patch_mask, patch_size, preproce
         raise ValueError("Patch size must divide the metric image dimensions")
     if channels != preprocessing["num_channels"] or preprocessing["std"] <= 0:
         raise ValueError("Metric preprocessing does not match the images")
+    target_z = validate_target_z(range(channels) if target_z is None else target_z, channels)
     expected = (batch, (height // patch_size) * (width // patch_size))
     if patch_mask.dtype != torch.bool or tuple(patch_mask.shape) != expected:
         raise ValueError(f"Expected boolean metric patch mask {expected}")
-    if not bool(torch.isfinite(images).all() and torch.isfinite(predictions).all()):
+    if not bool(torch.isfinite(images[:, list(target_z)]).all() and torch.isfinite(predictions[:, list(target_z)]).all()):
         raise FloatingPointError("Non-finite image or reconstruction in metrics")
     pixel_mask = patch_mask.reshape(batch, 1, height // patch_size, width // patch_size)
     pixel_mask = pixel_mask.repeat_interleave(patch_size, -2).repeat_interleave(patch_size, -1)
@@ -69,7 +72,7 @@ def reconstruction_metrics(images, predictions, patch_mask, patch_size, preproce
     # Process one Z at a time to avoid several full B*11*H*W SSIM intermediates.
     planes = []
     with torch.autocast(device_type=images.device.type, enabled=False):
-        for z in range(channels):
+        for z in target_z:
             target = images[:, z:z + 1].float() * preprocessing["std"] + preprocessing["mean"]
             predicted = predictions[:, z:z + 1].float() * preprocessing["std"] + preprocessing["mean"]
             error = predicted - target
@@ -138,12 +141,16 @@ class ReconstructionMetricLogger:
     as a directory group, NOT read/used as a supervised label.
     """
 
-    def __init__(self, files, preprocessing, output=None, logger=None, ssim_window=7, context=None):
+    def __init__(self, files, preprocessing, output=None, logger=None, ssim_window=7, context=None, target_z=None):
         validate_ssim_window(ssim_window)
         self.files = [Path(file) for file in files]
         if not self.files or len(set(self.files)) != len(self.files):
             raise ValueError("Metric files must be nonempty and unique")
         self.preprocessing = dict(preprocessing)
+        self.target_z = validate_target_z(
+            range(self.preprocessing["num_channels"]) if target_z is None else target_z,
+            self.preprocessing["num_channels"],
+        )
         self.output = Path(output) if output is not None else None
         self.logger, self.ssim_window = logger, ssim_window
         self.context = dict(context or {})
@@ -155,7 +162,7 @@ class ReconstructionMetricLogger:
         if start_index < 0 or start_index + len(images) > len(self.files):
             raise ValueError("Metric batch does not match the validation manifest")
         values, counts = reconstruction_metrics(
-            images, predictions, mask, patch_size, self.preprocessing, self.ssim_window,
+            images, predictions, mask, patch_size, self.preprocessing, self.ssim_window, self.target_z,
         )
         values = values.detach().double().cpu().numpy()
         for offset, value in enumerate(values):
@@ -190,6 +197,7 @@ class ReconstructionMetricLogger:
             "format": "ai01-reconstruction-metrics-v1", "time_utc": datetime.now(timezone.utc).isoformat(),
             "epoch": epoch, "num_frames": len(self.files), "num_wells": len(wells),
             "num_z": int(frame_z.shape[1]), "num_evaluations": len(self.pairs), "mask_seeds": seeds,
+            "input_num_z": self.preprocessing["num_channels"], "target_z": list(self.target_z),
             "context": self.context, "metric_definitions": METRICS,
             "protocol": {
                 "intensity_transform": "x_01 = normalized_x * preprocessing.std + preprocessing.mean",
@@ -199,7 +207,7 @@ class ReconstructionMetricLogger:
                 "ssim_region": "valid windows entirely inside the masked region; no visible/copied pixels",
                 "gradient_region": "horizontal/vertical pairs with both endpoints masked",
                 "undefined_metrics": "JSON null with count=0; excluded from aggregates, never replaced by zero",
-                "aggregation": "mean seeds per frame/Z; mean Z per frame; mean frames per well; equal-weight mean wells",
+                "aggregation": "mean seeds per frame/Z; mean selected target Z per frame; mean frames per well; equal-weight mean wells",
                 "std": "population standard deviation across the reported units; not a confidence interval",
                 "psnr_aggregation": "arithmetic mean of per-frame/per-Z/per-seed dB, NOT PSNR of pooled MSE",
                 "mask_reproducibility": "fixed seed, ordered manifest, batch size and device; keep these fixed for comparisons",
@@ -210,8 +218,8 @@ class ReconstructionMetricLogger:
                 "evaluations_without_windows": sum(count == 0 for count in self.ssim_windows),
             },
             "frame_macro": _describe(frame), "well_macro": _describe(well),
-            "per_z": {f"Z{z:02d}": {"frame_macro": _describe(frame_z[:, z]), "well_macro": _describe(well_z[:, z])}
-                      for z in range(frame_z.shape[1])},
+            "per_z": {f"Z{z:02d}": {"frame_macro": _describe(frame_z[:, index]), "well_macro": _describe(well_z[:, index])}
+                      for index, z in enumerate(self.target_z)},
             "per_well": per_well,
             "per_group": {},
         }
@@ -228,7 +236,7 @@ class ReconstructionMetricLogger:
         report = self.summary(epoch)
         lines = [
             f"[reconstruction] epoch={epoch} frames={report['num_frames']} wells={report['num_wells']} "
-            f"Z={report['num_z']} mask_seeds={report['mask_seeds']}",
+            f"input_Z={report['input_num_z']} target_z={report['target_z']} mask_seeds={report['mask_seeds']}",
             "Context: " + json.dumps(report["context"], ensure_ascii=True),
             "Directions: PSNR higher is better; SSIM closer to 1 is better; MAE/RMSE/gradient MAE lower is better.",
             "Huong doc: " + "; ".join(f"{name}: {definition['interpretation_vi']}" for name, definition in METRICS.items()),

@@ -40,8 +40,9 @@ unlabelled frame: [11, 400, 400, 1] (or already cropped)
   -> HF Swin V1 Tiny: depths [2,2,6,2], heads [3,6,12,24], window 7
   -> normalized feature maps at strides 4,8,16,32
   -> hierarchical reconstruction decoder
-  -> [B, (S/4)^2, 176] predicted patch pixels
-  -> masked-patch MSE against the original normalized stack
+  -> [B, (S/4)^2, 176] predicted patch pixels (11-Z layout retained)
+  -> select Z05, Z06, Z07: 4x4x3 = 48 supervised values per patch
+  -> masked-patch MSE on ONLY those three normalized target slices
 ```
 
 One sample is **one time point with all 11 Z planes**. Time is not a channel. You
@@ -59,6 +60,40 @@ ViT-MAE; 75% masking does not imply a 75% reduction in encoder memory.
 After pretraining, discard the reconstruction decoder and mask token. Transfer
 only `model.backbone` into Mask2Former. Mask2Former and the custom BiMamba decoder
 are still trained/fine-tuned using labelled AI01 data.
+
+### Reconstruction targets: Z05, Z06, Z07 only
+
+New runs default to **`--target_z 5 6 7`**, using zero-based array indices
+Z05/Z06/Z07 (the sixth, seventh and eighth stored planes). Both training and
+validation loss average only these Z and only the masked patches; the other
+eight Z have **no direct reconstruction-loss contribution**. Optional
+`--norm_pix_loss` computes patch normalization from the selected targets only.
+
+The encoder input remains **all 11 Z**, during SSL training and ordinary
+downstream inference. The same spatial mask hides all 11 channels at each masked
+position; other Z are visible context, not unmasked copies of the hidden target.
+Encoder configuration, state-dict shapes and strict 11-channel Mask2Former
+transfer remain unchanged. This change does not modify downstream segmentation.
+
+The SSL decoder still outputs the old 11-Z layout for architecture/checkpoint
+compatibility. **Only Z05-Z07 are supervised.** Predictions for the other eight
+Z are not trained reconstruction results; do not present them as reliable
+reconstructions or average their metrics into the new model's quality score.
+Decoder output rows for those Z have no reconstruction-loss gradient (optimizer
+weight decay can still change them). `unpatchify` still returns 11 channels.
+
+`target_z` is saved in `run_config.json`, `model_config` in full checkpoints and
+epoch summaries. Metrics use the same selected Z, label them Z05/Z06/Z07 and
+record `input_num_z=11`, `num_z=3`, `target_z=[5,6,7]` in their reports. To reproduce
+the old all-Z objective for an ablation, explicitly pass
+`--target_z 0 1 2 3 4 5 6 7 8 9 10`.
+
+**Old checkpoints without `target_z` are interpreted as supervising ALL 11 Z.**
+Resume refuses a different target set, so the existing all-Z 100-epoch run cannot
+silently turn into a three-Z run. Use a new output directory, optionally
+`--init_encoder "old_run/encoder-best.pt"`, to start the new objective with old
+encoder weights and a fresh decoder/optimizer. No change to `ai01_data.py` or Z
+channel ordering is needed.
 
 ## 2. Environment
 
@@ -202,46 +237,65 @@ does not silently remove them from existing models.
 For example, in Colab (use a new, empty `OUTPUT_DIR`):
 
 ```python
+from pathlib import Path
+import os
+
+os.chdir("/content/SwinMAE_FJN")
+OUTPUT_DIR = Path("/content/drive/MyDrive/0_Note_FJN/SwinMAE_FJN/output/v2/output_swin_z567_224_100e_bs32")
+if OUTPUT_DIR.exists() and any(OUTPUT_DIR.iterdir()):
+    raise FileExistsError("OUTPUT_DIR already contains files; choose a new directory")
+
 !python -u train_ai01.py \
     --manifest "/content/SwinMAE_FJN/datasets/train.txt" \
     --val_manifest "/content/SwinMAE_FJN/datasets/val.txt" \
     --output_dir "{OUTPUT_DIR}" \
     --image_size 224 \
-    --epochs 20 \
-    --warmup_epochs 2 \
+    --epochs 100 \
+    --warmup_epochs 10 \
     --max_steps 0 \
-    --batch_size 16 \
-    --accum_iter 2 \
+    --batch_size 32 \
+    --accum_iter 1 \
     --sampling frame \
     --num_workers 2 \
     --lr 0.0001 \
     --min_lr 0.000001 \
     --weight_decay 0.05 \
     --mask_ratio 0.75 \
+    --target_z 5 6 7 \
     --clip_grad 1.0 \
     --seed 42 \
-    --log_freq 20 \
+    --log_freq 10 \
     --feature_samples 3 \
     --feature_image_freq 5 \
     --feature_mode both \
     --stage_log_freq 20 \
     --save_freq 1 \
     --device cuda
+
+assert (OUTPUT_DIR / "checkpoint-last.pt").is_file(), "Training did not finish; inspect train.log"
 ```
 
-Batch 16 / accumulation 2 keeps the nominal effective batch at 32, like 8 / 4.
-It is a configuration to **try**, not a VRAM guarantee. Benchmark a short run
-in a separate output directory before committing to a full run on your GPU.
-If it runs out of memory, use 8 / 4. A larger microbatch can improve throughput
-but does not guarantee better downstream accuracy; 32 / 1 should only be tried
-after checking memory and throughput. Do not automatically increase the LR when
-the effective batch stays unchanged.
+Batch 32 / accumulation 1 preserves the user's current effective batch of 32.
+It is not a VRAM guarantee: if this does not fit, try 16 / 2 or 8 / 4 in a new
+run directory. A larger microbatch can improve throughput but does not guarantee
+better downstream accuracy. Do not automatically increase LR when the effective
+batch stays unchanged. The new v2 directory prevents mixing the old all-Z run
+with the new Z05-Z07 objective. Update the Colab clone first with
+`git pull --ff-only origin main`; no package changes are needed.
 
-Full checkpoints now store `image_size` in `model_config`, so the usual preview
-constructor `AI01SwinMAE(**checkpoint["model_config"])` restores the right size.
-Older full checkpoints without that field still default to 256. Resume must keep
-the same image size, batch size and accumulation; changing them requires a new
-run, optionally initialized with `--init_encoder`.
+Full checkpoints store `image_size` and `target_z` in `model_config`. To restore
+both old and new SSL models in a preview, use the compatibility helper:
+
+```python
+from ai01_targets import checkpoint_model_config
+model = AI01SwinMAE(**checkpoint_model_config(checkpoint["model_config"]))
+model.load_state_dict(checkpoint["model"], strict=True)
+```
+
+Missing legacy `image_size` means 256; missing legacy `target_z` means all 11 Z,
+not the new default 5-7. Resume must keep the same targets, image size, batch size
+and accumulation; changing them requires a new run, optionally initialized with
+`--init_encoder`.
 
 ### Progress and log files
 
@@ -261,9 +315,12 @@ All logs are written incrementally under `--output_dir`:
 
 With `--val_manifest`, the trainer now evaluates **every validation frame** after
 each epoch, reusing the predictions and masks from ordinary validation. Training
-loss, optimizer, model/checkpoint format and best-encoder selection are unchanged.
-No extra network forward is needed. Copy `ai01_metrics.py` alongside the trainer
-when updating Colab; no new pip dependency is required.
+loss and best-encoder selection use the configured target Z. Metric collection
+itself does not change that loss, the optimizer or model/checkpoint tensor shapes.
+No extra network forward is needed. Copy `ai01_metrics.py` and `ai01_targets.py`
+alongside the updated trainer/model when updating Colab; no new pip dependency
+is required. Metrics include **only the supervised target Z**, default Z05-Z07
+for new runs, not all 11 decoder output planes.
 
 | Metric | Interpretation | Unit |
 | --- | --- | --- |
@@ -299,8 +356,9 @@ Protocol:
 - If a mask has no eligible SSIM windows/gradient pairs, that measurement is
   `null` with a valid count of 0, not a fake zero score. Aggregates exclude
   undefined measurements, report valid counts and warn about missing windows.
-- Evaluate each Z separately. Aggregate seeds for the same frame/Z first, then
-  Z per frame, then frames per parent/well. **`well_macro` is the primary result:**
+- Evaluate each selected target Z separately. Aggregate seeds for the same
+  frame/Z first, then selected Z per frame, then frames per parent/well.
+  **`well_macro` is the primary result:**
   equal-weight mean +/- population std across wells. `frame_macro` gives equal
   frame weighting. Std is dispersion, not a confidence interval; adjacent frames
   are not independent patients. Per-Z, per-well and directory-group summaries
@@ -334,21 +392,42 @@ overwritten. Architecture, crop size and preprocessing come from the checkpoint.
 Encoder-only `encoder-best.pt`/`encoder-last.pt` lack the decoder and are rejected.
 
 ```python
+CHECKPOINT = OUTPUT_DIR / "checkpoint-last.pt"
+EVAL_DIR = OUTPUT_DIR / "metrics_eval_z567_seeds42_43_44"
+if not CHECKPOINT.is_file():
+    raise FileNotFoundError(CHECKPOINT)
+if EVAL_DIR.exists() and any(EVAL_DIR.iterdir()):
+    raise FileExistsError("EVAL_DIR already contains files; choose a new directory")
+
 !python -u evaluate_ai01.py \
-    --checkpoint "/content/drive/MyDrive/0_Note_FJN/SwinMAE_FJN/output/v1/output_swin_v1_224_100e_bs16/checkpoint-last.pt" \
+    --checkpoint "{CHECKPOINT}" \
     --val_manifest "/content/SwinMAE_FJN/datasets/val.txt" \
-    --output_dir "/content/drive/MyDrive/0_Note_FJN/SwinMAE_FJN/output/v1/metrics_epoch100" \
+    --output_dir "{EVAL_DIR}" \
     --batch_size 32 \
     --mask_seeds 42 43 44 \
+    --target_z 5 6 7 \
+    --max_samples 0 \
     --num_workers 2 \
     --device cuda
 ```
+
+This second cell is reconstruction **evaluation/inference**, not additional
+training or downstream segmentation. It still reads all 11 input Z. It scores
+only Z05-Z07 using the full checkpoint's decoder, on all validation frames and
+three fixed mask seeds. If a Colab runtime was restarted, restore `OUTPUT_DIR`
+and the repository working directory before running it. To compare an old all-Z
+run on Z05-Z07, point `CHECKPOINT` to its full checkpoint and choose a separate
+new `EVAL_DIR`; the explicit target subset is supported for legacy checkpoints.
 
 Default `--max_samples 0` evaluates the WHOLE validation manifest for every seed.
 Nonzero `--max_samples` is only for a clearly labeled first-N-frame smoke test,
 not the dataset result. By default the checkpoint's seed is used; the example
 above deliberately averages three mask realizations per frame. Do not interpret
 std across wells as std across seeds. Use the same protocol for every model.
+Evaluation defaults to the saved supervised Z. `--target_z 5 6 7` can restrict an
+old all-Z checkpoint to the same targets for fair comparisons. It cannot add Z
+that the checkpoint did not supervise. Logs distinguish saved training targets
+from evaluation targets; loss on an evaluation subset is not the old all-Z loss.
 
 Local example logs in `examples/ai01_reconstruction_metrics_smoke/` are an actual
 evaluation of the old **1-epoch / 3-training-batch smoke checkpoint**, on only
@@ -510,8 +589,9 @@ For a **format/training smoke test only**, not a useful pretrained model:
 python train_ai01.py --manifest "F:/data/train_unlabelled.txt" --output_dir "output_ai01_smoke" --epochs 1 --warmup_epochs 0 --batch_size 1 --max_steps 1 --device cuda
 ```
 
-The default reconstruction target is the AI01-normalized input. Optional
-`--norm_pix_loss` additionally normalizes each target patch; use this as an
+The default reconstruction targets are Z05-Z07 of the AI01-normalized input.
+Optional `--norm_pix_loss` additionally normalizes each selected target patch;
+use this as an
 ablation, not a silent preprocessing change. With this option, unpatchified
 predictions represent patch-normalized targets rather than raw image intensities.
 
