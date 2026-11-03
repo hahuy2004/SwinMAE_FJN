@@ -1,5 +1,6 @@
 """Unlabelled AI01 Z-stacks. No segmentation masks or label metadata are read."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import random
 
@@ -18,6 +19,8 @@ DEFAULT_PREPROCESSING = {
     "mean": float(np.mean([0.485, 0.456, 0.406])),
     "std": float(np.mean([0.229, 0.224, 0.225])),
 }
+# Path checks are network-latency bound on NAS mounts; threads overlap the round trips.
+CHECK_THREADS = 32
 
 
 def read_manifest(path):
@@ -28,9 +31,33 @@ def read_manifest(path):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        item = Path(line)
-        files.append((path.parent / item).resolve())
+        # Resolved later, in parallel, by AI01UnlabelledDataset.
+        files.append(path.parent / Path(line))
     return files
+
+
+def _resolve_and_check(file):
+    file = Path(file).resolve()
+    return file, file.suffix.lower() == ".npy" and file.is_file()
+
+
+def resolve_and_check_files(files):
+    """Resolve and verify every file in parallel; same result as a serial loop."""
+    files = list(files)
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        tqdm = None
+    with ThreadPoolExecutor(CHECK_THREADS) as pool:
+        results = pool.map(_resolve_and_check, files, chunksize=256)
+        if tqdm is not None and len(files) >= 10000:
+            results = tqdm(results, total=len(files), desc="Checking .npy files", unit="file",
+                           unit_scale=True, mininterval=5)
+        checked = list(results)
+    bad = sorted(str(file) for file, ok in checked if not ok)
+    if bad:
+        raise ValueError(f"Missing or invalid .npy image: {bad[0]} ({len(bad)} invalid in total)")
+    return sorted(set(file for file, _ in checked))
 
 
 def load_zstack(path, preprocessing=None, array_layout="auto"):
@@ -81,12 +108,9 @@ class AI01UnlabelledDataset(Dataset):
             if not root.is_dir():
                 raise ValueError(f"Not a data directory: {root}")
             files = list(root.rglob("*.npy"))
-        self.files = sorted(set(Path(file).resolve() for file in files))
-        if not self.files:
+        if not files:
             raise ValueError("No .npy images found")
-        for file in self.files:
-            if file.suffix.lower() != ".npy" or not file.is_file():
-                raise ValueError(f"Missing or invalid .npy image: {file}")
+        self.files = resolve_and_check_files(files)
         self.preprocessing = dict(DEFAULT_PREPROCESSING if preprocessing is None else preprocessing)
         self.array_layout = array_layout
         self.augment = augment
