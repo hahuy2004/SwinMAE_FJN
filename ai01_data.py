@@ -1,8 +1,10 @@
 """Unlabelled AI01 Z-stacks. No segmentation masks or label metadata are read."""
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import random
+import stat
 
 import numpy as np
 import torch
@@ -36,20 +38,35 @@ def read_manifest(path):
     return files
 
 
-def _resolve_and_check(file):
-    file = Path(file).resolve()
+def _check(file):
+    """Return (resolved file, is a .npy regular file); `file` has a resolved parent."""
+    if file.name in ("", ".", ".."):
+        file = file.resolve()
+    else:
+        try:
+            mode = os.lstat(file).st_mode
+        except OSError:
+            return file, False
+        if not stat.S_ISLNK(mode):
+            # resolve(parent) / name == resolve(file) unless the file itself is a symlink.
+            return file, file.suffix.lower() == ".npy" and stat.S_ISREG(mode)
+        file = file.resolve()
     return file, file.suffix.lower() == ".npy" and file.is_file()
 
 
 def resolve_and_check_files(files):
-    """Resolve and verify every file in parallel; same result as a serial loop."""
-    files = list(files)
+    """Equivalent to sorted(set(f.resolve())) plus an is_file() check, but each
+    directory is resolved once and files are checked in parallel (one lstat each)."""
+    files = [Path(file) for file in files]
     try:
         from tqdm.auto import tqdm
     except ImportError:
         tqdm = None
     with ThreadPoolExecutor(CHECK_THREADS) as pool:
-        results = pool.map(_resolve_and_check, files, chunksize=256)
+        parents = list(dict.fromkeys(file.parent for file in files))
+        resolved = dict(zip(parents, pool.map(Path.resolve, parents, chunksize=64)))
+        files = [resolved[file.parent] / file.name for file in files]
+        results = pool.map(_check, files, chunksize=256)
         if tqdm is not None and len(files) >= 10000:
             results = tqdm(results, total=len(files), desc="Checking .npy files", unit="file",
                            unit_scale=True, mininterval=5)
