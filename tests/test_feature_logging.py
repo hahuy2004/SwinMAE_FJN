@@ -20,9 +20,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ai01_features import FeatureLogger, feature_statistics, select_feature_indices, feature_geometry, pca_rgb, feature_drift
-from ai01_swin_mae import AI01SwinMAE
-from train_ai01 import configure_logger, main, parser
+from utils.ai01_features import FeatureLogger, feature_statistics, select_feature_indices, feature_geometry, pca_rgb, feature_drift
+from v1.ai01_model_v1 import AI01SwinMAE
+from v1.ai01_train_v1 import main, parser
+from utils.ai01_train import configure_logger
 
 
 class FixedDataset:
@@ -152,7 +153,7 @@ class FeatureLoggingTests(unittest.TestCase):
             self.assertTrue(torch.equal(torch.get_rng_state(), torch_rng))
             self.assertEqual(random.getstate(), python_rng)
             np.testing.assert_array_equal(np.random.get_state()[1], numpy_rng[1])
-            with patch("ai01_features.save_feature_grid") as save:
+            with patch("utils.ai01_features.save_feature_grid") as save:
                 debug.log_epoch(model, torch.device("cpu"), epoch=2, total_epochs=12)
                 save.assert_not_called()
                 debug.log_epoch(model, torch.device("cpu"), epoch=12, total_epochs=12)

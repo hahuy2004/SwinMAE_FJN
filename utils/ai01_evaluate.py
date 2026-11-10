@@ -1,4 +1,4 @@
-"""Evaluate a full AI01 SSL checkpoint on a validation manifest without training."""
+"""Shared reconstruction evaluation; the entry point supplies V1/V2 model hooks."""
 
 import argparse
 import os
@@ -9,12 +9,11 @@ os.environ.setdefault("USE_TF", "0")
 import torch
 from torch.utils.data import DataLoader
 
-from ai01_data import AI01UnlabelledDataset
-from ai01_metrics import ReconstructionMetricLogger, validate_ssim_window
-from ai01_swin_mae import AI01SwinMAE
-from ai01_targets import checkpoint_model_config, validate_target_z
-from ai01_transfer import validate_preprocessing
-from train_ai01 import configure_logger, dataset_signature, validate
+from .ai01_data import AI01UnlabelledDataset
+from .ai01_metrics import ReconstructionMetricLogger, validate_ssim_window
+from .ai01_targets import validate_target_z
+from .ai01_preprocessing import validate_preprocessing
+from .ai01_train import configure_logger, dataset_signature, validate
 
 
 def parser():
@@ -36,7 +35,7 @@ def parser():
     return result
 
 
-def main(args):
+def main(args, *, model_factory, training_format, saved_config_reader):
     validate_ssim_window(args.ssim_window)
     if args.batch_size < 1 or args.num_workers < 0 or args.log_freq < 1 or args.max_samples < 0:
         raise ValueError("Require batch_size/log_freq > 0 and num_workers/max_samples >= 0")
@@ -44,9 +43,9 @@ def main(args):
     if device.type not in ("cpu", "cuda") or (device.type == "cuda" and not torch.cuda.is_available()):
         raise ValueError("Select an available CPU or CUDA device")
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if state.get("format") != "ai01-swin-mae-training-v1":
+    if state.get("format") != training_format:
         raise ValueError("Reconstruction needs a FULL SSL checkpoint, including decoder; encoder-only exports cannot be evaluated")
-    model_config = checkpoint_model_config(state["model_config"])
+    model_config = saved_config_reader(state["model_config"])
     checkpoint_target_z = list(model_config["target_z"])
     if args.target_z is not None:
         selected = validate_target_z(args.target_z, state["preprocessing"]["num_channels"])
@@ -70,7 +69,7 @@ def main(args):
     original_count = len(dataset)
     if args.max_samples:
         dataset.files = dataset.files[:args.max_samples]
-    model = AI01SwinMAE(**model_config)
+    model = model_factory(**model_config)
     model.load_state_dict(state["model"], strict=True)
     epoch = state["epoch"]
     del state  # Release optimizer state before allocating GPU memory.
@@ -101,7 +100,3 @@ def main(args):
     report = monitor.write(epoch)
     logger.info("Evaluation complete: %s", output / "reconstruction_metrics_latest.json")
     return report
-
-
-if __name__ == "__main__":
-    main(parser().parse_args())

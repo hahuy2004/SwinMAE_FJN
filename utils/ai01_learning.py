@@ -1,4 +1,8 @@
-"""Read-only gradient/update diagnostics for the four HF Swin stages."""
+"""Shared read-only gradient/update diagnostics; groups supplied by V1/V2."""
+# File này ghi lại giá trị gradient và các thông số cập nhật của bốn giai đoạn (stages) trong mô hình Swin được triển khai bằng Hugging Face (HF).
+# Nó cung cấp các chức năng để theo dõi và ghi lại các thông tin liên quan đến quá trình huấn luyện,
+# bao gồm giá trị gradient, số lượng tham số có gradient, và các thay đổi trọng số trong mỗi giai đoạn.
+# Dữ liệu này được lưu trữ để phân tích và đánh giá hiệu suất của mô hình trong quá trình huấn luyện.
 
 from datetime import datetime, timezone
 import json
@@ -8,24 +12,11 @@ from pathlib import Path
 import torch
 
 
-def stage_parameters(backbone):
-    groups = {}
-    for index, layer in enumerate(backbone.encoder.layers, start=1):
-        parameters = list(layer.parameters())
-        parameters += list(backbone.hidden_states_norms[f"stage{index}"].parameters())
-        if index == 1:
-            parameters += list(backbone.embeddings.parameters())
-        groups[f"stage{index}"] = parameters
-    if len(groups) != 4:
-        raise ValueError("Learning diagnostics require four Swin stages")
-    return groups
-
-
 class StageLearningMonitor:
-    def __init__(self, backbone, output, logger, log_freq=20):
+    def __init__(self, groups, output, logger, log_freq=20):
         if log_freq < 1:
             raise ValueError("stage_log_freq must be positive")
-        self.groups = stage_parameters(backbone)
+        self.groups = groups
         self.path = Path(output) / "stage_learning.jsonl"
         self.logger, self.log_freq = logger, log_freq
 

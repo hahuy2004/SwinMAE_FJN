@@ -8,7 +8,7 @@ os.environ.setdefault("USE_TF", "0")
 import torch
 from transformers import Mask2FormerConfig, Mask2FormerForUniversalSegmentation
 
-from ai01_transfer import load_ai01_encoder, load_exported_backbone
+from .ai01_transfer_v1 import load_ai01_encoder, load_exported_backbone
 
 
 @torch.no_grad()

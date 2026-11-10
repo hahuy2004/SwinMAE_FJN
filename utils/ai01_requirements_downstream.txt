@@ -1,0 +1,3 @@
+# Optional: Mask2Former construction/loss and integration verification.
+-r ai01_requirements.txt
+scipy>=1.10,<2

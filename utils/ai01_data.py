@@ -1,4 +1,4 @@
-"""Unlabelled AI01 Z-stacks. No segmentation masks or label metadata are read."""
+"""Shared V1/V2 unlabelled Z-stacks. No segmentation labels are read."""
 
 from concurrent.futures import ThreadPoolExecutor
 import os

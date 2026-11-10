@@ -1,4 +1,7 @@
-"""Fixed-validation-sample diagnostics; never participates in optimization."""
+"""Shared V1/V2 fixed-sample diagnostics; never participates in optimization."""
+# File này chủ yếu thực hiện ghi lại và phân tích các đặc trưng (features) của mô hình Swin-MAE trong quá trình huấn luyện.
+# Nó cung cấp các chức năng để xuất encoder, đọc dữ liệu đã xuất, xác thực tiền xử lý, tải encoder AI01, và ghi lại các đặc trưng của mô hình trong quá trình huấn luyện.
+# Các đặc trưng này được lưu trữ và phân tích để đánh giá hiệu suất của mô hình và phát hiện các vấn đề tiềm ẩn trong quá trình huấn luyện.
 
 from datetime import datetime, timezone
 import hashlib

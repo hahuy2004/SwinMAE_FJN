@@ -11,12 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from ai01_data import DEFAULT_PREPROCESSING
-from ai01_metrics import ReconstructionMetricLogger, reconstruction_metrics
-from ai01_swin_mae import AI01SwinMAE
-from ai01_targets import checkpoint_model_config, validate_target_z
-from evaluate_ai01 import main as evaluate_main, parser as evaluation_parser
-from train_ai01 import parser
+from utils.ai01_data import DEFAULT_PREPROCESSING
+from utils.ai01_metrics import ReconstructionMetricLogger, reconstruction_metrics
+from v1.ai01_model_v1 import AI01SwinMAE, checkpoint_model_config
+from utils.ai01_targets import validate_target_z
+from v1.ai01_evaluate_v1 import main as evaluate_main, parser as evaluation_parser
+from v1.ai01_train_v1 import parser
 
 
 class TargetZTests(unittest.TestCase):

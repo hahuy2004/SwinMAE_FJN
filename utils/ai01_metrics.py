@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from ai01_targets import validate_target_z
+from .ai01_targets import validate_target_z
 
 
 METRICS = {

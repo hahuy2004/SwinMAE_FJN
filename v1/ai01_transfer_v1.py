@@ -2,12 +2,12 @@
 
 from pathlib import Path
 
-import numpy as np
 import torch
 import transformers
 from transformers import SwinBackbone, SwinConfig
 
-from ai01_data import DEFAULT_PREPROCESSING
+from utils.ai01_data import DEFAULT_PREPROCESSING
+from utils.ai01_preprocessing import validate_preprocessing
 
 
 FORMAT = "ai01-swin-backbone-v1"
@@ -44,34 +44,6 @@ def _read_export(path):
     if artifact.get("format") != FORMAT:
         raise ValueError("Not an AI01 encoder export; use encoder-last.pt, not the SSL training checkpoint")
     return artifact
-
-
-def validate_preprocessing(saved, image_processor=None):
-    expected = dict(DEFAULT_PREPROCESSING)
-    # Crop resolution may differ between SSL and fine-tuning. All other
-    # preprocessing (especially Z order and normalization) must still match.
-    image_size = saved.get("image_size")
-    if not isinstance(image_size, int) or image_size < 32 or image_size % 32:
-        raise ValueError("Preprocessing image_size must be a positive integer multiple of 32")
-    del expected["image_size"]
-    if image_processor is not None:
-        if image_processor.do_resize:
-            raise ValueError("AI01 processor must have do_resize=False (dataset performs center crop)")
-        if not image_processor.do_rescale or not image_processor.do_normalize:
-            raise ValueError("AI01 processor must rescale and normalize")
-        expected.update({
-            "rescale_factor": float(image_processor.rescale_factor),
-            "mean": float(np.mean(image_processor.image_mean)),
-            "std": float(np.mean(image_processor.image_std)),
-        })
-    for key, value in expected.items():
-        actual = saved.get(key)
-        if isinstance(value, float):
-            matches = actual is not None and np.isclose(actual, value, rtol=1e-6, atol=1e-8)
-        else:
-            matches = actual == value
-        if not matches:
-            raise ValueError(f"Preprocessing mismatch for {key}: SSL={actual}, AI01={value}")
 
 
 def load_ai01_encoder(model, path, image_processor=None):

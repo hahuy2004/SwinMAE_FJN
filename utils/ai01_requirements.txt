@@ -1,6 +1,6 @@
 # Separate environment from the historical RGB implementation.
 # Install the appropriate CUDA/CPU torch build for your machine first.
-# Then install the rest of the dependencies with pip install -r requirements-ai01.txt
+# Shared V1/V2: python -m pip install -r utils/ai01_requirements.txt
 torch>=2.6,<3
 transformers==4.53.1
 numpy>=1.24,<3

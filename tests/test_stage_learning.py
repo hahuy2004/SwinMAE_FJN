@@ -16,9 +16,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from ai01_learning import StageLearningMonitor, stage_parameters
-from ai01_swin_mae import AI01SwinMAE
-from train_ai01 import configure_logger, parser, train_epoch
+from v1.ai01_learning_v1 import StageLearningMonitor, stage_parameters
+from v1.ai01_model_v1 import AI01SwinMAE
+from v1.ai01_train_v1 import parser
+from utils.ai01_train import configure_logger, train_epoch
 
 
 class TinyBackbone(nn.Module):

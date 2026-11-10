@@ -2,18 +2,20 @@
 
 ### AI01: 11-channel Z-stack pretraining
 
-For the AI01 pipeline, use **`train_ai01.py`**, not the historical RGB `train.py`.
+For AI01, use **`python -m v1.ai01_train_v1`** or **`python -m v2.ai01_train_v2`**
+from this repository root. Code is organized into `v1/`, `v2/`, and shared `utils/`.
 See [README_AI01.md](README_AI01.md) for data layouts, training, strict encoder
 export/transfer into `A1_Refractor.ipynb`, and compatibility tests. The original
-RGB implementation below is preserved separately.
+RGB implementation below remains at its original root paths.
 
 ### Introduction
 This is a PyTorch implementation of [Swin MAE](https://arxiv.org/abs/2212.13805).
 
 ### Usage
-1. Install the required environment in "requirements.txt".
-2. Open "train.py" and fill in the dataset path. There should be at least one category folder under this path. The data for training is stored in the category folder.
-3. Run "train.py".
+The original RGB files remain in the repository root (not the AI01 pipeline).
+1. Install its separate environment from `requirements.txt`.
+2. Open `train.py` and fill in the dataset path. There should be at least one category folder under this path. The data for training is stored in the category folder.
+3. From the repository root, run `python train.py`.
 
 ### Dataset
 The paper utilizes two datasets: 

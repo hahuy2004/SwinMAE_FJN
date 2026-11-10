@@ -1,4 +1,4 @@
-"""Offline tests: data parity, masking, gradients, strict transfer, downstream forward."""
+"""Offline V1 tests: data parity, masking, gradients, transfer and downstream."""
 
 import json
 import os
@@ -14,11 +14,11 @@ import numpy as np
 import torch
 from transformers import Mask2FormerConfig, Mask2FormerForUniversalSegmentation, Mask2FormerImageProcessor
 
-from ai01_data import (
+from utils.ai01_data import (
     AI01UnlabelledDataset, DEFAULT_PREPROCESSING, ensure_disjoint_wells, load_zstack,
 )
-from ai01_swin_mae import AI01SwinMAE, ai01_swin_config
-from ai01_transfer import export_encoder, load_ai01_encoder, load_exported_backbone
+from v1.ai01_model_v1 import AI01SwinMAE, ai01_swin_config
+from v1.ai01_transfer_v1 import export_encoder, load_ai01_encoder, load_exported_backbone
 
 
 class DataTests(unittest.TestCase):

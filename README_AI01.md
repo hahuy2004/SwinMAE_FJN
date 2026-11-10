@@ -1,725 +1,129 @@
-# AI01 — self-supervised Swin-T pretraining
+# AI01 Swin-MAE — V1 / V2 / shared utils
 
-This entry point learns from unlabelled AI01 Z-stacks and exports **the ordinary
-Hugging Face `SwinBackbone` used by `A1_Refractor.ipynb`**. There is no custom SSL
-module to keep at inference, no RGB conversion and no SwinV2 substitution.
+## Cấu trúc và quy tắc tên
 
-The historical RGB `train.py`, `swin_mae.py`, `swin_unet.py` and `visualize.py`
-remain unchanged. **Use `train_ai01.py` for AI01.** The old RGB checkpoints and
-visualizer are not interchangeable with this branch.
-
-## Google Colab (clone repository + CLI)
-
-Open [`AI01_SSL_SwinMAE_Colab.ipynb`](AI01_SSL_SwinMAE_Colab.ipynb), enable a GPU,
-clone `https://github.com/hahuy2004/SwinMAE_FJN.git` and use
-`os.chdir("/content/SwinMAE_FJN")`. The notebook uses the repository's Python
-files directly; **no embedded model/trainer code**. Install `requirements-ai01.txt`
-and extract `Prepared_Dataset.zip` inside the cloned repository so that
-`Prepared_Dataset/train.txt` and `Prepared_Dataset/validation.txt` exist.
-
-The training cell is a direct **`!python -u train_ai01.py ...`** command. Defaults
-are one epoch capped at 3 training batches, followed by validation on all 72
-held-out samples. For longer training, change the parameters and use a new
-`OUTPUT_DIR`. Checkpoints default to a directory inside the clone. Download or
-back up files before a runtime reset, or set `OUTPUT_DIR` directly on Drive for
-per-epoch persistent saves. Drive backup/download and transfer verification are
-optional cells, disabled by default.
-
-For AI01 integration, use `encoder-best.pt`/`encoder-last.pt`, not the full
-`checkpoint-last.pt`. Resume examples are provided as Markdown so Run all never
-starts a second training job. Drive authentication itself requires Colab.
-
-## 1. What is trained?
+File riêng phiên bản: **`ai01_<chức năng>_v1.py` / `ai01_<chức năng>_v2.py`**.
+File dùng chung: **`utils/ai01_<chức năng>.py`**, không nhân bản theo phiên bản.
 
 ```text
-unlabelled frame: [11, 400, 400, 1] (or already cropped)
-  -> center crop / squeeze / normalize
-  -> [B, 11, S, S], S = --image_size (224 or 256; default 256)
-  -> 4x4 patch projection: 11 -> 96
-  -> mask groups of 4x4 TOKENS (16x16 pixels), default 75%
-  -> HF Swin V1 Tiny: depths [2,2,6,2], heads [3,6,12,24], window 7
-  -> normalized feature maps at strides 4,8,16,32
-  -> hierarchical reconstruction decoder
-  -> [B, (S/4)^2, 176] predicted patch pixels (11-Z layout retained)
-  -> select Z05, Z06, Z07: 4x4x3 = 48 supervised values per patch
-  -> masked-patch MSE on ONLY those three normalized target slices
+Swin-MAE/
+├── swin_mae.py                 # Code RGB gốc, giữ nguyên vị trí
+├── swin_unet.py
+├── train.py
+├── visualize.py
+├── requirements.txt            # Môi trường RGB gốc, tách biệt AI01
+├── v1/
+│   ├── ai01_model_v1.py
+│   ├── ai01_train_v1.py
+│   ├── ai01_evaluate_v1.py
+│   ├── ai01_transfer_v1.py
+│   ├── ai01_learning_v1.py
+│   ├── ai01_verify_v1.py
+│   ├── ai01_colab_v1.ipynb
+│   └── README.md
+├── v2/
+│   ├── ai01_model_v2.py
+│   ├── ai01_train_v2.py
+│   ├── ai01_evaluate_v2.py
+│   ├── ai01_transfer_v2.py
+│   ├── ai01_learning_v2.py
+│   ├── ai01_verify_v2.py
+│   ├── ai01_colab_v2.ipynb
+│   └── README.md
+├── utils/
+│   ├── ai01_data.py            # Đọc NPY, crop, normalize, chia well
+│   ├── ai01_targets.py         # Chọn Z giám sát; chung cho cả V1/V2
+│   ├── ai01_metrics.py         # Masked PSNR/SSIM/MAE/RMSE/gradient MAE
+│   ├── ai01_features.py        # Thống kê/ảnh feature và baseline
+│   ├── ai01_layers.py          # PatchExpansion trung lập kiến trúc
+│   ├── ai01_preprocessing.py   # Kiểm tra preprocessing khi transfer
+│   ├── ai01_learning.py        # Vòng ghi gradient/update diagnostics
+│   ├── ai01_train.py           # Vòng train/resume dùng chung
+│   ├── ai01_evaluate.py        # Vòng evaluation dùng chung
+│   ├── ai01_requirements.txt
+│   ├── ai01_requirements_downstream.txt
+│   └── ...                    # Các utility RGB gốc được giữ lại
+└── tests/
 ```
 
-One sample is **one time point with all 11 Z planes**. Time is not a channel. You
-do not need a sequence of 32 frames to pretrain the spatial backbone. Z order is
-preserved; augmentations are applied to all planes together. No labels, masks,
-PN counts or fake zero images for missing files are generated.
+`v1/` và `v2/` chỉ import `utils/` và thư viện ngoài, không import lẫn nhau.
+`utils/` không import model/package phiên bản; entry point truyền model và hooks.
+Hai model vẫn khác attention/norm/position bias, không chia sẻ checkpoint cho nhau.
+Các file Swin-MAE RGB gốc và utility RGB vẫn ở vị trí cũ. Chỉ code AI01 được
+tổ chức trong `v1/`, `v2/`, `utils/`; không dùng `train.py` RGB cho dữ liệu 11 Z.
 
-The reconstruction decoder adapts the original repo's patch expansion + Swin
-blocks, adding masked multi-scale fusion so that all four backbone output norms
-receive gradients. It uses HF Swin blocks/padding too. This is an AI01 adaptation
-of Swin MAE, **not a byte-for-byte reproduction of the paper**. Masked token
-positions are kept in the dense Swin grid (as in this repo), not removed as in
-ViT-MAE; 75% masking does not imply a 75% reduction in encoder memory.
+## Chạy từ root `SSL/Swin-MAE`
 
-After pretraining, discard the reconstruction decoder and mask token. Transfer
-only `model.backbone` into Mask2Former. Mask2Former and the custom BiMamba decoder
-are still trained/fine-tuned using labelled AI01 data.
-
-### Reconstruction targets: Z05, Z06, Z07 only
-
-New runs default to **`--target_z 5 6 7`**, using zero-based array indices
-Z05/Z06/Z07 (the sixth, seventh and eighth stored planes). Both training and
-validation loss average only these Z and only the masked patches; the other
-eight Z have **no direct reconstruction-loss contribution**. Optional
-`--norm_pix_loss` computes patch normalization from the selected targets only.
-
-The encoder input remains **all 11 Z**, during SSL training and ordinary
-downstream inference. The same spatial mask hides all 11 channels at each masked
-position; other Z are visible context, not unmasked copies of the hidden target.
-Encoder configuration, state-dict shapes and strict 11-channel Mask2Former
-transfer remain unchanged. This change does not modify downstream segmentation.
-
-The SSL decoder still outputs the old 11-Z layout for architecture/checkpoint
-compatibility. **Only Z05-Z07 are supervised.** Predictions for the other eight
-Z are not trained reconstruction results; do not present them as reliable
-reconstructions or average their metrics into the new model's quality score.
-Decoder output rows for those Z have no reconstruction-loss gradient (optimizer
-weight decay can still change them). `unpatchify` still returns 11 channels.
-
-`target_z` is saved in `run_config.json`, `model_config` in full checkpoints and
-epoch summaries. Metrics use the same selected Z, label them Z05/Z06/Z07 and
-record `input_num_z=11`, `num_z=3`, `target_z=[5,6,7]` in their reports. To reproduce
-the old all-Z objective for an ablation, explicitly pass
-`--target_z 0 1 2 3 4 5 6 7 8 9 10`.
-
-**Old checkpoints without `target_z` are interpreted as supervising ALL 11 Z.**
-Resume refuses a different target set, so the existing all-Z 100-epoch run cannot
-silently turn into a three-Z run. Use a new output directory, optionally
-`--init_encoder "old_run/encoder-best.pt"`, to start the new objective with old
-encoder weights and a fresh decoder/optimizer. No change to `ai01_data.py` or Z
-channel ordering is needed.
-
-## 2. Environment
-
-From `SSL/Swin-MAE`, in a **separate environment** from the historical RGB repo:
+Cài PyTorch phù hợp CUDA/CPU trước. V1 và V2 dùng chung môi trường:
 
 ```powershell
-python -m pip install -r requirements-ai01.txt
+python -m pip install -r utils/ai01_requirements.txt
+# Thêm SciPy nếu cần Mask2Former hoặc full tests:
+python -m pip install -r utils/ai01_requirements_downstream.txt
 ```
-
-Install the appropriate CUDA/CPU PyTorch build for your system first. This branch
-uses PyTorch >=2.6 and pins Transformers 4.53.1. Other Transformers versions may
-work, but must pass the tests/strict transfer; internal Swin APIs are used for
-masked embeddings and decoder blocks. The standalone SSL trainer does not need
-Mamba, OpenCV, Albumentations, torchvision or TensorFlow. The AI01 notebook still
-requires its existing training dependencies, including `mamba_ssm`.
-
-## 3. Data
-
-For raw `session/DISH/time/*.jpg` images, use the converter at
-[`../../data/convert_ai01_raw.py`](../../data/convert_ai01_raw.py). See the
-[Vietnamese conversion guide](../../data/README_CONVERT_AI01.md) for verified
-sample grouping, square ROI cropping/resizing, previews and train/validation
-manifests. Use the generated manifests rather than scanning the entire prepared
-root, which contains both splits. The converter additionally requires Pillow.
-
-Supported `.npy` layouts (`--array_layout auto` by default):
-
-| Layout | Shape |
-| --- | --- |
-| `zhwc` | `[11, H, W, 1]`, original AI01 format |
-| `zhw` | `[11, H, W]` |
-| `hwz` | `[H, W, 11]` |
-
-Use **raw intensities in [0,255]**, normally uint8, not already normalized arrays
-or floats rescaled to [0,1]. Finite values and shapes are checked. Images must be
-at least `--image_size` on each spatial axis. With the default 256, a 400x400
-input is cropped `[72:328,72:328]`, matching AI01. With 224 it is cropped
-`[88:312,88:312]`. This is a **center crop, not a resize**: the 224 setting sees
-a smaller field of view at the same pixel scale.
-All channels are retained in their stored order, Z0 through Z10.
-
-Normalization matches the notebook's one-channel image processor:
-
-```python
-x = (x / 255.0 - mean([0.485, 0.456, 0.406])) / mean([0.229, 0.224, 0.225])
-```
-
-Do not point the loader at a directory containing segmentation `.npy` masks or
-other arrays. Use a prepared **image-only** root, for example:
-
-```text
-prepared_images/
-  well_001/
-    001.npy
-    002.npy
-  well_002/
-    001.npy
-```
-
-Or, preferably, create a UTF-8 text manifest with one image path per line:
-
-```text
-# train_unlabelled.txt; relative paths resolve relative to THIS manifest
-prepared_images/well_001/001.npy
-prepared_images/well_001/002.npy
-prepared_images/well_002/001.npy
-```
-
-Absolute paths work too. No category folders are required. The trainer never
-searches for label metadata or calls the notebook's label-dependent dataset.
-
-**Split by well (or patient/embryo if wells are not independent) BEFORE SSL.**
-Exclude supervised validation/test wells from SSL for a conventional held-out
-evaluation. Consecutive frames from one well must not cross splits. Optional SSL
-validation rejects overlapping parent/well directories; patient-level isolation
-still needs to be enforced in your manifests.
-
-Default `--sampling well` samples wells equally in expectation, assuming one
-parent directory per well, then frames within that well. This limits domination
-by long recordings. Use `--sampling frame` for uniform sampling without
-replacement over frames when that grouping is not appropriate. Neither option
-guarantees distinct wells or distant time points within every batch.
-
-## 4. Train
-
-Run from the repo directory; replace the example paths with your real data:
 
 ```powershell
-python train_ai01.py --manifest "F:/data/train_unlabelled.txt" --output_dir "output_ai01_ssl" --epochs 100 --batch_size 4 --accum_iter 4 --lr 0.0001 --device cuda
+python -m v1.ai01_train_v1 --manifest "Prepared_Dataset/train.txt" --val_manifest "Prepared_Dataset/validation.txt" --output_dir "output_ai01_v1_ssl" --device cuda
+python -m v2.ai01_train_v2 --manifest "Prepared_Dataset/train.txt" --val_manifest "Prepared_Dataset/validation.txt" --output_dir "output_ai01_v2_ssl" --gradient_checkpointing --device cuda
 ```
 
-Or scan an image-only root:
+Dùng `python -m ...`, **không** `python v1/ai01_train_v1.py`, không `cd v1`/`cd v2`.
+Manifest, output và checkpoint tiếp tục resolve từ working directory; file NPY
+trong manifest vẫn resolve từ thư mục chứa manifest, không từ package code.
 
-```powershell
-python train_ai01.py --data_path "F:/data/prepared_images_train" --output_dir "output_ai01_ssl" --epochs 100 --batch_size 4 --device cuda
-```
+| Chức năng | V1 | V2 |
+|---|---|---|
+| Train | `python -m v1.ai01_train_v1` | `python -m v2.ai01_train_v2` |
+| Evaluate | `python -m v1.ai01_evaluate_v1` | `python -m v2.ai01_evaluate_v2` |
+| Verify | `python -m v1.ai01_verify_v1` | `python -m v2.ai01_verify_v2` |
+| Colab | [v1/ai01_colab_v1.ipynb](v1/ai01_colab_v1.ipynb) | [v2/ai01_colab_v2.ipynb](v2/ai01_colab_v2.ipynb) |
+| Chi tiết | [v1/README.md](v1/README.md) | [v2/README.md](v2/README.md) |
 
-Optional SSL validation from separate wells:
+## Đổi từ đường dẫn cũ
 
-```powershell
-python train_ai01.py --manifest "F:/data/train_unlabelled.txt" --val_manifest "F:/data/ssl_val.txt" --output_dir "output_ai01_ssl" --epochs 100 --batch_size 4 --device cuda
-```
+Không giữ các wrapper cũ ở root để tránh hai tên cho cùng một chức năng:
 
-Start with `--batch_size 1` on a small GPU; use accumulation to increase the
-effective batch. CUDA fp16 AMP is on by default; disable with `--no_amp` if
-needed. `--device cpu` also works. Workers default to 0 for Windows safety; tune
-`--num_workers` for your storage/machine. An epoch draws `len(dataset)` samples;
-well-balanced sampling is with replacement.
+| Cũ | Mới |
+|---|---|
+| `train_ai01.py` | `python -m v1.ai01_train_v1` |
+| `ai01_v2_train.py` | `python -m v2.ai01_train_v2` |
+| `evaluate_ai01.py` / `ai01_v2_evaluate.py` | `v1/ai01_evaluate_v1.py` / `v2/ai01_evaluate_v2.py` |
+| `verify_ai01.py` / `ai01_v2_verify.py` | `v1/ai01_verify_v1.py` / `v2/ai01_verify_v2.py` |
+| `ai01_swin_mae.py` / `ai01_v2_swin_mae.py` | `v1/ai01_model_v1.py` / `v2/ai01_model_v2.py` |
+| `ai01_transfer.py` / `ai01_v2_transfer.py` | `v1/ai01_transfer_v1.py` / `v2/ai01_transfer_v2.py` |
+| `ai01_data.py`, `ai01_targets.py`, `ai01_metrics.py`, `ai01_features.py` | Cùng tên, nằm trong `utils/` |
+| `requirements-ai01.txt`, `ai01_v2_requirements.txt` | `utils/ai01_requirements.txt` |
+| `ai01_v2_requirements_downstream.txt` | `utils/ai01_requirements_downstream.txt` |
+| `AI01_SSL_SwinMAE_Colab.ipynb` | `v1/ai01_colab_v1.ipynb` |
 
-With fp16 AMP, gradient clipping runs after `GradScaler.unscale_` and lets the
-scaler skip updates with Inf/NaN gradients and reduce its scale. Such an overflow
-does not itself stop training. Non-finite loss still raises immediately; with
-AMP disabled, non-finite gradient norms also remain fatal. A finite loss does
-not prove finite gradients, and repeated skipped updates still need diagnosis.
-
-### Select the SSL image size
-
-Use `--image_size 224` or `--image_size 256` (default). This single argument sets
-train/validation center crops, encoder resolution, mask grid, reconstruction
-shape and checkpoint metadata. The 11 channels and **4x4 patch size remain
-unchanged** to match the downstream AI01 Swin-T. No patch-size argument is needed.
-
-The multi-scale decoder is an adaptation, not a proven improvement over a
-last-stage-only decoder. Shallow skips may make local reconstruction easier;
-they do not copy raw masked pixels (all features come from masked embeddings).
-To study mask difficulty without changing the decoder, compare the default
-`--mask_group_size 4` (16x16 pixels) with `--mask_group_size 8` (32x32 pixels)
-in separate runs, keeping other settings fixed. At size 256, group 8 masks
-exactly 75%; at 224 there are 49 groups, so rounding masks 37/49 (about 75.51%).
-Adjacent masked groups can form larger regions; a visible token inside every
-attention window is not guaranteed. Compare encoders through controlled
-downstream fine-tuning, not reconstruction MSE alone. Disabling skips would
-require a separate decoder variant and checkpoint configuration; this change
-does not silently remove them from existing models.
-
-| Image size | Patch grid | 4x4-token mask groups | Masked patches at 75% |
-| --- | --- | --- | --- |
-| 224 | 56x56 | 14x14 | 2352 of 3136 |
-| 256 | 64x64 | 16x16 | 3072 of 4096 |
-
-For example, in Colab (use a new, empty `OUTPUT_DIR`):
+Import vào notebook AI01 (thêm **root Swin-MAE**, không phải thư mục v1/v2, vào sys.path):
 
 ```python
-from pathlib import Path
-import os
-
-os.chdir("/content/SwinMAE_FJN")
-OUTPUT_DIR = Path("/content/drive/MyDrive/0_Note_FJN/SwinMAE_FJN/output/v2/output_swin_z567_224_100e_bs32")
-if OUTPUT_DIR.exists() and any(OUTPUT_DIR.iterdir()):
-    raise FileExistsError("OUTPUT_DIR already contains files; choose a new directory")
-
-!python -u train_ai01.py \
-    --manifest "/content/SwinMAE_FJN/datasets/train.txt" \
-    --val_manifest "/content/SwinMAE_FJN/datasets/val.txt" \
-    --output_dir "{OUTPUT_DIR}" \
-    --image_size 224 \
-    --epochs 100 \
-    --warmup_epochs 10 \
-    --max_steps 0 \
-    --batch_size 32 \
-    --accum_iter 1 \
-    --sampling frame \
-    --num_workers 2 \
-    --lr 0.0001 \
-    --min_lr 0.000001 \
-    --weight_decay 0.05 \
-    --mask_ratio 0.75 \
-    --target_z 5 6 7 \
-    --clip_grad 1.0 \
-    --seed 42 \
-    --log_freq 10 \
-    --feature_samples 3 \
-    --feature_image_freq 5 \
-    --feature_mode both \
-    --stage_log_freq 20 \
-    --save_freq 1 \
-    --device cuda
-
-assert (OUTPUT_DIR / "checkpoint-last.pt").is_file(), "Training did not finish; inspect train.log"
+from v1.ai01_transfer_v1 import load_ai01_encoder
+from v2.ai01_transfer_v2 import load_ai01_v2_encoder
+from utils.ai01_data import DEFAULT_PREPROCESSING
+from utils.ai01_targets import validate_target_z
 ```
 
-Batch 32 / accumulation 1 preserves the user's current effective batch of 32.
-It is not a VRAM guarantee: if this does not fit, try 16 / 2 or 8 / 4 in a new
-run directory. A larger microbatch can improve throughput but does not guarantee
-better downstream accuracy. Do not automatically increase LR when the effective
-batch stays unchanged. The new v2 directory prevents mixing the old all-Z run
-with the new Z05-Z07 objective. Update the Colab clone first with
-`git pull --ff-only origin main`; no package changes are needed.
-
-Full checkpoints store `image_size` and `target_z` in `model_config`. To restore
-both old and new SSL models in a preview, use the compatibility helper:
+`checkpoint_model_config` dành riêng cho định dạng checkpoint nằm trong model
+từng phiên bản, không nằm trong shared targets:
 
 ```python
-from ai01_targets import checkpoint_model_config
-model = AI01SwinMAE(**checkpoint_model_config(checkpoint["model_config"]))
-model.load_state_dict(checkpoint["model"], strict=True)
+from v1.ai01_model_v1 import checkpoint_model_config  # Legacy all-Z fallback của V1
+# hoặc: from v2.ai01_model_v2 import checkpoint_model_config
 ```
 
-Missing legacy `image_size` means 256; missing legacy `target_z` means all 11 Z,
-not the new default 5-7. Resume must keep the same targets, image size, batch size
-and accumulation; changing them requires a new run, optionally initialized with
-`--init_encoder`.
-
-### Progress and log files
-
-Use `--log_freq 20` (default) or `--log_freq 10` to print train and validation
-progress every N **batches**, plus the first and last batch. A step here is a
-DataLoader batch, not an optimizer update: with `--accum_iter 4`, weights are
-updated after four batches. Logs include current loss, running mean loss,
-learning rate (train), elapsed time and estimated remaining time for that phase.
-
-All logs are written incrementally under `--output_dir`:
-
-- `train.log`: timestamped console messages, epoch summaries and CLI exceptions.
-- `steps.jsonl`: structured metrics at the configured logging intervals.
-- `log.jsonl`: one summary per completed epoch, retained for existing plotting code.
-
-### Reconstruction quality metrics (full validation)
-
-With `--val_manifest`, the trainer now evaluates **every validation frame** after
-each epoch, reusing the predictions and masks from ordinary validation. Training
-loss and best-encoder selection use the configured target Z. Metric collection
-itself does not change that loss, the optimizer or model/checkpoint tensor shapes.
-No extra network forward is needed. Copy `ai01_metrics.py` and `ai01_targets.py`
-alongside the updated trainer/model when updating Colab; no new pip dependency
-is required. Metrics include **only the supervised target Z**, default Z05-Z07
-for new runs, not all 11 decoder output planes.
-
-| Metric | Interpretation | Unit |
-| --- | --- | --- |
-| `masked_psnr` | Higher is better / Càng cao càng tốt | dB |
-| `masked_ssim` | Closer to 1 is better / Càng gần 1 càng tốt | Dimensionless; may be negative |
-| `masked_mae` | Lower is better / Càng thấp càng tốt | Gray levels, 0..255 reference scale |
-| `masked_rmse` | Lower is better / Càng thấp càng tốt | Gray levels, 0..255 reference scale |
-| `masked_gradient_mae` | Lower is better / Càng thấp càng tốt | Gray-level differences per pixel |
-
-These are full-reference reconstruction measurements, not segmentation accuracy
-or evidence that PN details are biologically correct. PSNR and RMSE are derived
-from MSE; SSIM and gradient MAE add structural/detail comparisons, but none has a
-universal "good model" threshold. Do not optimize image sharpness alone.
-
-Protocol:
-
-- Undo dataset normalization with `x_01 = x * std + mean`, using the saved
-  preprocessing, **without clipping or per-image min-max stretching**. Fix the
-  PSNR/SSIM data range at 1. Errors are converted to the 0..255 reference scale
-  only for MAE/RMSE/gradient MAE. They are not in training-loss units.
-- PSNR/MAE/RMSE score masked pixels only. PSNR is computed for each frame/Z/seed
-  before averaging dB; this is NOT PSNR of pooled MSE. Exact/near-exact prediction
-  PSNR is capped at 120 dB (MSE floor 1e-12) for finite, standards-compliant JSON.
-- SSIM uses uniform 7x7 **valid** windows, K1=.01, K2=.03 and population
-  covariance. Average the SSIM map only where the **entire window is masked**,
-  excluding image edges and copied/visible pixels. This is a masked-window
-  protocol, not ordinary full-image SSIM. `--ssim_window` changes the odd window
-  size; keep it fixed between experiments. Windows overlapping the mask boundary
-  are excluded, so this metric does not measure seam quality.
-- Gradient MAE compares horizontal/vertical one-pixel finite differences only
-  for pairs with both endpoints masked. A lower score means gradients better
-  match the reference, not merely that the prediction is sharper.
-- If a mask has no eligible SSIM windows/gradient pairs, that measurement is
-  `null` with a valid count of 0, not a fake zero score. Aggregates exclude
-  undefined measurements, report valid counts and warn about missing windows.
-- Evaluate each selected target Z separately. Aggregate seeds for the same
-  frame/Z first, then selected Z per frame, then frames per parent/well.
-  **`well_macro` is the primary result:**
-  equal-weight mean +/- population std across wells. `frame_macro` gives equal
-  frame weighting. Std is dispersion, not a confidence interval; adjacent frames
-  are not independent patients. Per-Z, per-well and directory-group summaries
-  are included. A well means one parent directory, not verified patient identity.
-- Validation keeps its existing fixed random generator. For reproducible masks
-  between epochs/models, keep seed, ordered manifest, batch size and device
-  fixed. Full-validation metric evaluation is independent of `--max_steps`,
-  which limits training only, and `--feature_samples`, which limits debug images.
-
-Files under `--output_dir`:
-
-- `reconstruction_metrics.log`: readable numbers with higher/lower-is-better
-  labels, units, frame/well aggregates, each Z, group and well.
-- `reconstruction_metrics.jsonl`: one complete structured report per epoch.
-- `reconstruction_metrics_latest.json`: the latest report, including protocol,
-  directions, sample counts, valid counts and mean/std.
-- `log.jsonl` additionally includes `validation_reconstruction_well_macro`.
-  Existing `train_loss`/`validation_loss` plotting still works. Console/`train.log`
-  prints the frame and well summaries with directions.
-
-Metrics are on by default; `--no_reconstruction_metrics` disables their overhead.
-They are explicitly disabled with a warning for `--norm_pix_loss`: those outputs
-are patch-standardized, not absolute image intensities. Do NOT invert them with
-ground-truth patch means/variances, which would leak unavailable target information.
-
-#### Evaluate an existing full checkpoint without retraining
-
-Use the new `evaluate_ai01.py`, **not** `--resume`, to evaluate an already completed
-100-epoch run. The output directory must be new/empty; training files are never
-overwritten. Architecture, crop size and preprocessing come from the checkpoint.
-Encoder-only `encoder-best.pt`/`encoder-last.pt` lack the decoder and are rejected.
-
-```python
-CHECKPOINT = OUTPUT_DIR / "checkpoint-last.pt"
-EVAL_DIR = OUTPUT_DIR / "metrics_eval_z567_seeds42_43_44"
-if not CHECKPOINT.is_file():
-    raise FileNotFoundError(CHECKPOINT)
-if EVAL_DIR.exists() and any(EVAL_DIR.iterdir()):
-    raise FileExistsError("EVAL_DIR already contains files; choose a new directory")
-
-!python -u evaluate_ai01.py \
-    --checkpoint "{CHECKPOINT}" \
-    --val_manifest "/content/SwinMAE_FJN/datasets/val.txt" \
-    --output_dir "{EVAL_DIR}" \
-    --batch_size 32 \
-    --mask_seeds 42 43 44 \
-    --target_z 5 6 7 \
-    --max_samples 0 \
-    --num_workers 2 \
-    --device cuda
-```
-
-This second cell is reconstruction **evaluation/inference**, not additional
-training or downstream segmentation. It still reads all 11 input Z. It scores
-only Z05-Z07 using the full checkpoint's decoder, on all validation frames and
-three fixed mask seeds. If a Colab runtime was restarted, restore `OUTPUT_DIR`
-and the repository working directory before running it. To compare an old all-Z
-run on Z05-Z07, point `CHECKPOINT` to its full checkpoint and choose a separate
-new `EVAL_DIR`; the explicit target subset is supported for legacy checkpoints.
-
-Default `--max_samples 0` evaluates the WHOLE validation manifest for every seed.
-Nonzero `--max_samples` is only for a clearly labeled first-N-frame smoke test,
-not the dataset result. By default the checkpoint's seed is used; the example
-above deliberately averages three mask realizations per frame. Do not interpret
-std across wells as std across seeds. Use the same protocol for every model.
-Evaluation defaults to the saved supervised Z. `--target_z 5 6 7` can restrict an
-old all-Z checkpoint to the same targets for fair comparisons. It cannot add Z
-that the checkpoint did not supervise. Logs distinguish saved training targets
-from evaluation targets; loss on an evaluation subset is not the old all-Z loss.
-
-Local example logs in `examples/ai01_reconstruction_metrics_smoke/` are an actual
-evaluation of the old **1-epoch / 3-training-batch smoke checkpoint**, on only
-three validation frames at size 256. They demonstrate the file format and are
-**not** results for the user's 224 / 100-epoch model or the full validation set.
-Generated example logs/checkpoints are ignored by Git and are not included in a
-fresh clone. To create your own format example, run the evaluator with a full
-checkpoint, a new output directory and `--max_samples 3`; omit that option for
-the actual full-validation report.
-
-### Stage feature diagnostics
-
-With `--val_manifest`, diagnostics run after the epoch summary and before the
-full/last checkpoint save. Defaults are:
-
-- `--feature_samples 3`: up to three fixed validation images, preferring one
-  frame from each distinct parent/well directory; fill from remaining frames if
-  there are fewer wells. `0` disables all feature logging.
-- `--feature_image_freq 5`: PNGs at baseline epoch 0, epoch 1, every fifth epoch, and the final
-  epoch. `0` disables PNGs but retains per-epoch statistics.
-- `--feature_mode both` (default): logs/saves the masked SSL encoder path and
-  the ordinary unmasked backbone forward separately. Either mode can also be
-  selected on its own.
-
-Each sample logs all four normalized stage outputs: shape, `finite`, `min`,
-`max`, `mean`, `std` and `spatial_std`. `std` is population standard deviation
-over the whole feature tensor. `spatial_std` is population standard deviation
-over HxW within each channel, averaged over channels. NaN/Inf produces a warning,
-a count of non-finite values and JSON `null` statistics, not invalid JSON NaNs.
-
-Additional geometry diagnostics use the full **spatial tokens x channels**
-matrix for each sample/stage, centered over tokens for PCA:
-
-- `effective_rank`: exp(entropy of normalized squared singular values), i.e.
-  variance-spectrum effective rank. `effective_rank_fraction` divides by
-  `max_centered_rank = min(H*W-1, C)`. At stage 4 this maximum is 63 for input
-  256 and 48 for input 224, not 768.
-- `pca_top1_variance_ratio`, `pca_top3_variance_ratio`: explained-variance
-  fractions. Undefined (JSON null) when there is no spatial variance.
-- `mean_token_cosine`: mean pairwise cosine of distinct **uncentered**, nonzero
-  token vectors, computed without materializing an NxN similarity matrix.
-- `low_variance_channel_fraction`: fraction of channels with population spatial
-  std below 1e-3. This is a debug threshold, not proof a neuron is dead. Min,
-  p10, median and max spatial std, plus the zero-token fraction, are also saved.
-- `feature_rel_l2_from_baseline`, `feature_cosine_from_baseline`: change in the
-  same fixed sample/mask/stage relative to the saved pre-training reference.
-
-Before a new run trains, the logger records **epoch 0**, labeled `random_init`
-or `init_encoder` as appropriate. Baseline features, PCA bases and RGB limits
-are persisted in `feature_debug/baseline_<signature>.pt`. Resume reuses these
-references (including when the output directory changes but the checkpoint's
-feature_debug directory is available), without rewriting epoch-0 images/logs.
-An old checkpoint or changed diagnostic sample/mode settings without a matching
-reference creates a clearly labeled **resume-epoch baseline**, not fake random
-epoch 0. Keep the baseline file with checkpoints to retain comparisons.
-
-Diagnostics run in `eval()` / `inference_mode()` using FP32 and no augmentation.
-Images and masks are cached on CPU. Each mask is generated with a dedicated CPU
-generator seeded with `--seed + validation_index`, so neither sample selection
-nor masks consume the training RNG. They remain fixed between epochs/resumes
-with the same data, model settings and seed. The diagnostic pass does not update
-weights and restores the previous model training/eval mode.
-Ordinary unmasked HF forwards can mutate per-layer window/shift attributes on
-small maps; diagnostics also restore those attributes before the next SSL pass.
-
-Example format (numbers below are placeholders, not experimental results):
-
-```text
-Epoch summary: {"epoch": 5, ...}
-[features] epoch=5 sample=0 mode=masked mask_seed=42 source=.../frame.npy
-[features] stage1 shape=(1, 96, 64, 64) finite=True min=... max=... mean=... std=... spatial_std=...
-[features] stage2 shape=(1, 192, 32, 32) finite=True min=... max=... mean=... std=... spatial_std=...
-[features] stage3 shape=(1, 384, 16, 16) finite=True min=... max=... mean=... std=... spatial_std=...
-[features] stage4 shape=(1, 768, 8, 8) finite=True min=... max=... mean=... std=... spatial_std=...
-[features] Saved feature_debug/epoch005_val0000_masked.png
-Saving full checkpoint and last encoder for epoch 5...
-```
-
-The stage shapes above are for 256 input; at 224 they are 56x56, 28x28, 14x14,
-7x7. The original channel PNG has four stage rows and four channel columns. The
-fixed channel indices are 0, C//3, 2*C//3, C-1. Each panel has its own 1st/99th
-percentile contrast limits: colors are not directly comparable amplitudes and
-are not segmentation probabilities. Only the fixed reference features are saved
-as tensors; no full feature tensors are dumped every epoch. A second
-`*_pca.png` shows all four stages as PCA-to-RGB maps. Each sample/mode/stage uses
-its own baseline-fitted mean, 3-component basis, and 1st/99th percentile RGB
-limits, frozen across epochs. Colors are comparable **over time for that same
-panel**, not across different samples or stages, and may saturate as features
-drift. PCA structure is not a semantic segmentation prediction.
-Plotting uses Matplotlib's headless Agg canvas, installed through the
-updated `requirements-ai01.txt`; include the new `ai01_features.py` when copying
-files to Colab.
-
-Outputs under `--output_dir`:
-
-- `train.log`: the same feature messages printed to the console.
-- `feature_stats.jsonl`: one structured row per epoch/sample/mode, including
-  source image, mask seed/hash, actual masked fraction and all stage statistics.
-- `feature_debug/samples.json`: the fixed sample indices, paths and mask metadata.
-- `feature_debug/epoch005_val0000_masked.png`: example naming for a feature PNG.
-- `feature_debug/epoch005_val0000_masked_pca.png`: matching PCA-to-RGB view.
-
-Without validation data, feature logging is explicitly disabled; it does not
-silently use augmented training images. Diagnostic options may change on resume
-without changing the optimization schedule, but keep them fixed for comparisons.
-Mean near zero/std near one can come from LayerNorm, and nonzero spatial
-variation is possible even before training. These are debugging signals, not
-proof of useful learning. Low spatial rank on one homogeneous image is not
-enough to diagnose dataset-wide collapse; compare multiple fixed images/modes.
-
-### Stage learning: gradients and actual parameter changes
-
-`--stage_log_freq 20` (default) logs each stage's gradient L2 norm every 20
-**optimizer update attempts**, plus first/last. This is independent of
-`--log_freq`, which counts DataLoader batches. `--stage_log_freq 0` disables this
-monitor; feature logging remains independently controlled.
-
-Gradients are read **after unscale and before clipping**. Logs distinguish
-missing gradients, zero gradients and non-finite gradient norms. AMP skip events
-and scale reductions are recorded even between sampled gradient logs. At the
-epoch summary, `weight_delta_norm`, `weight_rel_change` (delta norm divided by
-epoch-start parameter norm), `changed`, and successful/skipped update counts
-show whether parameters really changed. Snapshots are on CPU, once per epoch;
-they add roughly one encoder's worth of CPU RAM, not GPU RAM.
-
-Grouping follows HF encoder.layers: each stage includes its layer/downsampling
-parameters and corresponding output normalization; stage 1 also includes patch
-embeddings. Norms are not normalized for differing parameter counts; do not rank
-stage importance by their magnitude. Weight changes may include AdamW decay or
-momentum, so use gradient, skip, feature drift and reconstruction loss together.
-
-```text
-[learning] epoch=1 update=20/491 stage3 grad_norm=... finite=True grad_none=0 skipped=False
-[learning] epoch=1 stage3 weight_rel_change=... changed=True finite=True
-[learning] epoch=1 successful_updates=.../491 skipped=...
-```
-
-Messages go to console/`train.log`; structured gradient samples, skip events and
-epoch parameter deltas go to `stage_learning.jsonl`. This monitor also works
-without validation data. Copy the new `ai01_learning.py` along with the trainer.
-Neither gradients, parameter changes, non-collapse metrics nor PCA views prove
-PN usefulness; downstream fine-tuning/probing is still the deciding evaluation.
-
-`--log_freq` controls logging only. `--save_freq 1` saves full/last checkpoints
-after every epoch; the best encoder is saved when validation MSE improves. It
-does not save a checkpoint every N logging steps. Logging frequency may be
-changed on resume without changing the training schedule.
-
-Manifest paths are relative to the manifest file's own directory. For example,
-if a line is `2/well/001.npy` and the image is under `datasets/2/well/001.npy`,
-the manifest should be stored in `datasets/`, not copied to its parent directory
-without changing its entries. For Colab, keeping images on the local `/content`
-disk and saving output checkpoints/logs to mounted Drive avoids many slow image
-reads through Drive.
-
-For a **format/training smoke test only**, not a useful pretrained model:
-
-```powershell
-python train_ai01.py --manifest "F:/data/train_unlabelled.txt" --output_dir "output_ai01_smoke" --epochs 1 --warmup_epochs 0 --batch_size 1 --max_steps 1 --device cuda
-```
-
-The default reconstruction targets are Z05-Z07 of the AI01-normalized input.
-Optional `--norm_pix_loss` additionally normalizes each selected target patch;
-use this as an
-ablation, not a silent preprocessing change. With this option, unpatchified
-predictions represent patch-normalized targets rather than raw image intensities.
-
-Outputs:
-
-| File | Purpose |
-| --- | --- |
-| `encoder-last.pt` | **Encoder-only export to load in AI01** |
-| `encoder-best.pt` | Best encoder by SSL validation MSE; only when validation is supplied |
-| `checkpoint-last.pt` | Full SSL model/decoder/optimizer/scaler/RNG state for resume |
-| `run_config.json` | Architecture, preprocessing and training arguments |
-| `train_files.txt`, `validation_files.txt` | Actual data manifests (validation file is optional) |
-| `log.jsonl` | Training/validation MSE and learning rate |
-| `reconstruction_metrics.log` | Readable masked reconstruction metrics, units and higher/lower-is-better labels |
-| `reconstruction_metrics.jsonl` | Full-validation frame/well/Z/group metric reports per epoch |
-| `reconstruction_metrics_latest.json` | Latest complete reconstruction metric report |
-| `train.log` | Timestamped console progress, summaries and errors |
-| `steps.jsonl` | Train/validation batch metrics at `--log_freq` intervals |
-| `feature_stats.jsonl` | Per-epoch fixed-sample stage activation statistics |
-| `stage_learning.jsonl` | Unscaled/pre-clip gradient norms, AMP skips and per-epoch weight deltas |
-| `feature_debug/` | Sample metadata and periodic four-stage PNG grids |
-
-Encoder exports contain all state-dict tensors, backbone config, preprocessing
-metadata and Transformers version. They do **not** include the SSL decoder.
-`checkpoint-last.pt` is intentionally a different format and is rejected by the
-AI01 encoder loader. Files are PyTorch dictionaries, not RGB Hub checkpoints.
-
-Resume from an epoch boundary using the same training arguments, plus:
-
-```powershell
-python train_ai01.py --manifest "F:/data/train_unlabelled.txt" --output_dir "output_ai01_ssl" --epochs 100 --batch_size 4 --accum_iter 4 --lr 0.0001 --device cuda --resume "output_ai01_ssl/checkpoint-last.pt"
-```
-
-Resume checks manifests and optimization/model settings; don't change the
-schedule silently. A new SSL run with a different schedule can use
-`--init_encoder "output_ai01_ssl/encoder-last.pt"` instead (new decoder and
-optimizer). Only load checkpoints from trusted sources.
-
-## 5. Integrate into `A1_Refractor.ipynb`
-
-The notebook now has two optional settings in its configuration cell:
-
-```python
-SSL_ENCODER_CHECKPOINT = "F:/checkpoints/ai01_ssl/encoder-last.pt"
-SSL_CODE_DIR = Path("F:/WFH_APP/Fujinet/AI01/SSL/Swin-MAE")
-```
-
-Set paths for the machine actually running the notebook. On Linux, use Linux
-paths. Leave `SSL_ENCODER_CHECKPOINT = ""` to preserve random initialization.
-
-The model-initialization cell now:
-
-1. Sets backbone metadata to 11 channels and image size 256.
-2. Creates the model and 11-channel patch projection.
-3. Loads SSL encoder weights **strictly**, before Trainer/optimizer creation.
-4. Keeps the existing custom Mask2Former forward and BiMamba decoder replacement.
-
-The loader checks architecture, preprocessing, every tensor key and every shape
-before copying weights. SSL crop size is allowed to differ: an encoder pretrained
-at 224 can be loaded into AI01 at 256 without changing weights because this Swin
-uses relative window positions, not absolute image-position embeddings. All
-other preprocessing fields (including Z order and normalization) must still
-match. This does not change AI01's input crop to 224 or retain the SSL decoder.
-**No `strict=False`, discarded layers or silent partial
-load.** Do not recreate the patch projection AFTER loading SSL. Do not later
-load an old full-model checkpoint or resume an unrelated supervised run unless
-you intend to overwrite the SSL initialization.
-
-Without notebook integration, equivalent Python is:
-
-```python
-from ai01_transfer import load_ai01_encoder
-
-# hf_model is already a Mask2Former with an 11-channel Swin-T backbone.
-report = load_ai01_encoder(hf_model, "encoder-last.pt", image_processor=image_processor)
-print(report)
-```
-
-To use the exported model as a standalone backbone:
-
-```python
-from ai01_transfer import load_exported_backbone
-
-backbone = load_exported_backbone("encoder-last.pt").eval()
-# Input must use the saved AI01 preprocessing, shape [N,11,256,256].
-features = backbone(pixel_values).feature_maps
-# [N,96,64,64], [N,192,32,32], [N,384,16,16], [N,768,8,8]
-```
-
-## 6. Verify compatibility
-
-Offline automated tests (synthetic data; no Hub/network needed):
+**Không thay đổi state-dict keys, format metadata, target Z, loss, lịch train hoặc
+đường dẫn dataset/output hiện có.** Encoder/full checkpoint cũ vẫn dùng với đúng
+phiên bản, không cần train lại chỉ vì đổi layout. Resume vẫn cần cùng tham số run.
+Không sửa/xóa checkpoint hoặc dữ liệu có sẵn.
+
+## Kiểm thử
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-Tests cover processor/crop/layout parity with the notebook, 11-channel patch
-round-trip, grouped masking, masked-only loss, no masked-pixel leakage, gradients
-through all encoder/decoder parameters, exact feature equality after strict
-transfer, rejected incompatible exports, and a full ordinary Mask2Former forward
-at 256x256. Notebook code-cell syntax and SSL loading order are also checked.
-
-For your actual export and the **actual AI01 Hub configuration**:
-
-```powershell
-python verify_ai01.py --encoder "output_ai01_ssl/encoder-last.pt" --device cuda
-```
-
-This downloads only the configuration of
-`facebook/mask2former-swin-tiny-coco-instance`, not its pretrained weights. For
-offline use, pass `--mask2former_config "path/to/local/config_directory"`.
-It checks exact feature equality after transfer and executes a Mask2Former
-forward. It does not execute the notebook's custom Mamba decoder or its dataset.
-
-### Checks performed during this implementation
-
-On PyTorch 2.7.0 / Transformers 4.53.1, the offline suite passed. A separate
-CUDA fp16 smoke run on synthetic 11x400x400x1 data also completed one training
-step, SSL validation, encoder/full-checkpoint save and resume loading. The
-export loaded all **237 backbone tensors** against the actual Hub Mask2Former
-configuration, produced exactly matching backbone features, and returned class
-logits `[1,7,3]` and mask logits `[1,7,64,64]`. These are compatibility checks,
-not evidence of pretraining quality or an execution of the full BiMamba notebook.
-
-**Compatibility is testable; improved accuracy is not guaranteed.** The backbone
-is Swin Transformer itself, not a substitute merely producing similar shapes.
-Its architecture/weights interface can be verified. You still need real SSL
-training and controlled supervised fine-tuning experiments to measure benefit.
-SSL MSE alone does not measure PN segmentation quality. Compare random vs SSL
-initialization with identical labelled splits, settings and evaluation metrics.
+Các bài test kiểm tra V1/V2, train/resume/evaluate, strict transfer, Mask2Former,
+import isolation, module CLI và notebook/path migration. GPU/Colab/Drive thực tế
+vẫn cần môi trường tương ứng để kiểm chứng, không suy ra chất lượng SSL từ test.

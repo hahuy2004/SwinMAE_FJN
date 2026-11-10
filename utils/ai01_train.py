@@ -1,4 +1,4 @@
-"""Train AI01's 11-channel HF Swin-T using unlabelled Z-stacks only."""
+"""Shared V1/V2 training CLI options and loop; models supplied by entry points."""
 
 import argparse
 from contextlib import nullcontext
@@ -21,13 +21,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from ai01_data import AI01UnlabelledDataset, DEFAULT_PREPROCESSING, ensure_disjoint_wells
-from ai01_features import FeatureLogger
-from ai01_learning import StageLearningMonitor
-from ai01_metrics import ReconstructionMetricLogger, validate_ssim_window
-from ai01_swin_mae import AI01SwinMAE
-from ai01_targets import DEFAULT_TARGET_Z, checkpoint_model_config, validate_target_z
-from ai01_transfer import export_encoder, load_ai01_encoder
+from .ai01_data import AI01UnlabelledDataset, DEFAULT_PREPROCESSING, ensure_disjoint_wells
+from .ai01_features import FeatureLogger
+from .ai01_metrics import ReconstructionMetricLogger, validate_ssim_window
+from .ai01_targets import DEFAULT_TARGET_Z, validate_target_z
 
 
 def parser():
@@ -228,7 +225,10 @@ def dataset_signature(dataset):
     return hashlib.sha256("\n".join(map(str, dataset.files)).encode("utf-8")).hexdigest()
 
 
-def main(args):
+def main(args, *, model_factory, encoder_exporter, encoder_loader, training_format,
+         saved_config_reader, monitor_factory,
+         parameter_groups=None):
+    """Version-neutral loop; never constructs or imports a V1/V2 model itself."""
     validate_ssim_window(args.ssim_window)
     args.target_z = list(validate_target_z(args.target_z, DEFAULT_PREPROCESSING["num_channels"]))
     if args.image_size not in (224, 256):
@@ -297,32 +297,33 @@ def main(args):
         ensure_disjoint_wells(dataset, validation_dataset)
         validation_loader = DataLoader(validation_dataset, batch_size=args.batch_size, shuffle=False)
         logger.info("Validation images=%s, manifest=%s", len(validation_dataset), Path(args.val_manifest).resolve())
-    model = AI01SwinMAE(
+    model = model_factory(
         mask_ratio=args.mask_ratio, mask_group_size=args.mask_group_size,
         norm_pix_loss=args.norm_pix_loss, decoder_depth=args.decoder_depth,
         image_size=args.image_size,
         target_z=args.target_z,
     )
     if args.init_encoder:
-        logger.info("Initialized encoder: %s", load_ai01_encoder(model.backbone, args.init_encoder))
+        logger.info("Initialized encoder: %s", encoder_loader(model.backbone, args.init_encoder))
     model.to(device)
     decay, no_decay = [], []
     for parameter in model.parameters():
         (no_decay if parameter.ndim <= 1 else decay).append(parameter)
-    optimizer = torch.optim.AdamW([
+    groups = [
         {"params": decay, "weight_decay": args.weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
-    ], lr=args.lr, betas=(0.9, 0.95))
+    ] if parameter_groups is None else parameter_groups(model, args.weight_decay)
+    optimizer = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     signature = dataset_signature(dataset)
     validation_signature = dataset_signature(validation_dataset) if validation_dataset else None
     start_epoch, best_loss = 0, float("inf")
     if args.resume:
         state = torch.load(args.resume, map_location="cpu", weights_only=True)
-        if state.get("format") != "ai01-swin-mae-training-v1":
+        if state.get("format") != training_format:
             raise ValueError("Resume requires an AI01 SSL training checkpoint")
         # Legacy checkpoints used 256 if size is absent, and ALL Z if target_z is absent.
-        saved_model_config = checkpoint_model_config(state["model_config"])
+        saved_model_config = saved_config_reader(state["model_config"])
         if saved_model_config["target_z"] != list(model.target_z):
             raise ValueError("Resume target_z differs from the checkpoint. Start a NEW run with --init_encoder to change supervision; do not silently resume the old objective")
         if saved_model_config != model.training_config() or state["preprocessing"] != preprocessing:
@@ -367,7 +368,7 @@ def main(args):
                 origin="resume" if args.resume else "init_encoder" if args.init_encoder else "random_init",
                 resume_directory=Path(args.resume).parent if args.resume else None,
             )
-    learning_monitor = StageLearningMonitor(model.backbone, output, logger, args.stage_log_freq) if args.stage_log_freq else None
+    learning_monitor = monitor_factory(model.backbone, output, logger, args.stage_log_freq) if args.stage_log_freq else None
     for epoch in range(start_epoch, args.epochs):
         logger.info("Starting epoch %s/%s", epoch + 1, args.epochs)
         train_loss = train_epoch(model, loader, optimizer, scaler, device, args, epoch, use_amp,
@@ -384,7 +385,7 @@ def main(args):
         reconstruction_report = reconstruction_monitor.write(epoch + 1) if reconstruction_monitor is not None else None
         if validation_loss is not None and validation_loss < best_loss:
             best_loss = validation_loss
-            export_encoder(model.backbone, output / "encoder-best.pt", preprocessing)
+            encoder_exporter(model.backbone, output / "encoder-best.pt", preprocessing)
             logger.info("Saved encoder-best.pt: validation_loss=%.6f", best_loss)
         stats = {"epoch": epoch + 1, "train_loss": train_loss, "validation_loss": validation_loss,
                  "lr": optimizer.param_groups[0]["lr"], "target_z": list(model.target_z),
@@ -403,7 +404,7 @@ def main(args):
         if (epoch + 1) % args.save_freq == 0 or epoch + 1 == args.epochs:
             logger.info("Saving full checkpoint and last encoder for epoch %s...", epoch + 1)
             atomic_save({
-                "format": "ai01-swin-mae-training-v1", "model": model.state_dict(),
+                "format": training_format, "model": model.state_dict(),
                 "model_config": model.training_config(), "preprocessing": preprocessing,
                 "optimizer": optimizer.state_dict(), "scaler": scaler.state_dict(),
                 "epoch": epoch + 1, "best_loss": best_loss, "args": vars(args),
@@ -412,14 +413,6 @@ def main(args):
                 "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
                 "loader_rng": generator.get_state(),
             }, output / "checkpoint-last.pt")
-            export_encoder(model.backbone, output / "encoder-last.pt", preprocessing)
+            encoder_exporter(model.backbone, output / "encoder-last.pt", preprocessing)
             logger.info("Saved checkpoint-last.pt and encoder-last.pt")
     logger.info("Encoder export: %s", output / "encoder-last.pt")
-
-
-if __name__ == "__main__":
-    try:
-        main(parser().parse_args())
-    except Exception:
-        logging.getLogger("ai01_ssl").exception("Training failed")
-        raise

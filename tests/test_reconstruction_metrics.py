@@ -19,8 +19,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from ai01_metrics import ReconstructionMetricLogger, reconstruction_metrics
-from train_ai01 import parser, validate
+from utils.ai01_metrics import ReconstructionMetricLogger, reconstruction_metrics
+from v1.ai01_train_v1 import parser
+from utils.ai01_train import validate
 
 
 SPEC = {"num_channels": 2, "mean": 0.449, "std": 0.226, "image_size": 32}

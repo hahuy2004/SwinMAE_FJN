@@ -14,7 +14,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from train_ai01 import parser, train_epoch
+from v1.ai01_train_v1 import parser
+from utils.ai01_train import train_epoch
 
 
 class TinyMAE(nn.Module):

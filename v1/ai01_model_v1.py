@@ -13,10 +13,12 @@ from torch import nn
 from transformers import SwinBackbone, SwinConfig
 from transformers.models.swin.modeling_swin import SwinStage
 
-from ai01_targets import DEFAULT_TARGET_Z, validate_target_z
+from utils.ai01_layers import PatchExpansion
+from utils.ai01_targets import DEFAULT_TARGET_Z, validate_target_z
 
 
 STAGE_NAMES = ["stage1", "stage2", "stage3", "stage4"]
+TRAINING_FORMAT = "ai01-swin-mae-training-v1"
 
 
 def ai01_swin_config(image_size=256):
@@ -30,21 +32,6 @@ def ai01_swin_config(image_size=256):
         drop_path_rate=0.3, use_absolute_embeddings=False,
         out_features=STAGE_NAMES,
     )
-
-
-class PatchExpansion(nn.Module):
-    """Double spatial resolution and halve channels (the original decoder layout)."""
-
-    def __init__(self, dim):
-        super().__init__()
-        self.expand = nn.Linear(dim, 2 * dim, bias=False)
-        self.norm = nn.LayerNorm(dim // 2)
-
-    def forward(self, x):
-        batch, height, width, channels = x.shape
-        x = self.expand(x).reshape(batch, height, width, 2, 2, channels // 2)
-        x = x.permute(0, 1, 3, 2, 4, 5).reshape(batch, 2 * height, 2 * width, channels // 2)
-        return self.norm(x)
 
 
 class ReconstructionDecoder(nn.Module):
@@ -198,3 +185,10 @@ class AI01SwinMAE(nn.Module):
         features = self.forward_encoder(images, mask)
         prediction = self.decoder(features)
         return self.forward_loss(images, prediction, mask), prediction, mask
+
+
+def checkpoint_model_config(saved, num_channels=11):
+    """Old V1 checkpoints without target_z supervised ALL 11 Z, not just 5-7."""
+    result = {"image_size": 256, "target_z": list(range(num_channels)), **saved}
+    result["target_z"] = list(validate_target_z(result["target_z"], num_channels))
+    return result

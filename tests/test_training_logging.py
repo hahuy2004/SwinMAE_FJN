@@ -16,7 +16,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from train_ai01 import configure_logger, log_progress, main, parser, train_epoch, validate
+from v1.ai01_train_v1 import main, parser
+from utils.ai01_train import configure_logger, log_progress, train_epoch, validate
 
 
 class TinyMAE(nn.Module):

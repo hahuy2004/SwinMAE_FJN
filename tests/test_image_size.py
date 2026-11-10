@@ -15,10 +15,11 @@ import numpy as np
 import torch
 from transformers import Mask2FormerConfig, Mask2FormerForUniversalSegmentation, Mask2FormerImageProcessor
 
-from ai01_data import DEFAULT_PREPROCESSING, load_zstack
-from ai01_swin_mae import AI01SwinMAE, ai01_swin_config
-from ai01_transfer import export_encoder, load_ai01_encoder, validate_preprocessing
-from train_ai01 import parser
+from utils.ai01_data import DEFAULT_PREPROCESSING, load_zstack
+from v1.ai01_model_v1 import AI01SwinMAE, ai01_swin_config
+from v1.ai01_transfer_v1 import export_encoder, load_ai01_encoder
+from utils.ai01_preprocessing import validate_preprocessing
+from v1.ai01_train_v1 import parser
 
 
 class ImageSizeTests(unittest.TestCase):
